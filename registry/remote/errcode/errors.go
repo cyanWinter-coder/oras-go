@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -106,6 +107,11 @@ type ErrorResponse struct {
 	URL        *url.URL
 	StatusCode int
 	Errors     Errors
+	// RetryAfter is the wait hint carried by the Retry-After response
+	// header, or 0 if the response did not carry a usable one. It lets a
+	// caller that only sees the error know how long the server asked to
+	// wait before retrying.
+	RetryAfter time.Duration
 }
 
 // Error returns a error string describing the error.

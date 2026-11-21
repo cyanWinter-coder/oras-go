@@ -19,7 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
@@ -30,12 +33,16 @@ import (
 // sufficient.
 const maxErrorBytes int64 = 8 * 1024 // 8 KiB
 
+// headerRetryAfter is the header key for Retry-After.
+const headerRetryAfter = "Retry-After"
+
 // ParseErrorResponse parses the error returned by the remote registry.
 func ParseErrorResponse(resp *http.Response) error {
 	resultErr := &errcode.ErrorResponse{
 		Method:     resp.Request.Method,
 		URL:        resp.Request.URL,
 		StatusCode: resp.StatusCode,
+		RetryAfter: parseRetryAfter(resp),
 	}
 	var body struct {
 		Errors errcode.Errors `json:"errors"`
@@ -45,6 +52,35 @@ func ParseErrorResponse(resp *http.Response) error {
 		resultErr.Errors = body.Errors
 	}
 	return resultErr
+}
+
+// parseRetryAfter parses the Retry-After header of resp, handling both the
+// delta-seconds and the HTTP-date forms. It returns 0 when the header is
+// missing, unparseable, zero, or in the past.
+func parseRetryAfter(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
+	v := resp.Header.Get(headerRetryAfter)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		// saturate instead of overflowing time.Duration
+		if secs > int64(math.MaxInt64/time.Second) {
+			return time.Duration(math.MaxInt64)
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // IsErrorCode returns true if err is an Error and its Code equals to code.

@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
@@ -125,6 +126,68 @@ func Test_ParseErrorResponse_plain(t *testing.T) {
 	if want := http.StatusText(http.StatusUnauthorized); !strings.Contains(errmsg, want) {
 		t.Errorf("ParseErrorResponse() error = %v, want err message %v", err, want)
 	}
+}
+
+func Test_ParseErrorResponse_retryAfter(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter string
+		want       time.Duration
+	}{
+		{name: "delta seconds", retryAfter: "120", want: 120 * time.Second},
+		{name: "zero", retryAfter: "0", want: 0},
+		{name: "negative", retryAfter: "-1", want: 0},
+		{name: "unparseable", retryAfter: "soon", want: 0},
+		{name: "missing", retryAfter: "", want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.retryAfter != "" {
+					w.Header().Set("Retry-After", tt.retryAfter)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+			}))
+			defer ts.Close()
+
+			resp, err := http.Get(ts.URL)
+			if err != nil {
+				t.Fatalf("failed to do request: %v", err)
+			}
+			err = ParseErrorResponse(resp)
+			var errResp *errcode.ErrorResponse
+			if !errors.As(err, &errResp) {
+				t.Fatalf("ParseErrorResponse() error = %v, want an *errcode.ErrorResponse", err)
+			}
+			if errResp.RetryAfter != tt.want {
+				t.Errorf("ParseErrorResponse() RetryAfter = %v, want %v", errResp.RetryAfter, tt.want)
+			}
+		})
+	}
+
+	t.Run("HTTP date", func(t *testing.T) {
+		want := 90 * time.Second
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Retry-After", time.Now().Add(want).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer ts.Close()
+
+		resp, err := http.Get(ts.URL)
+		if err != nil {
+			t.Fatalf("failed to do request: %v", err)
+		}
+		err = ParseErrorResponse(resp)
+		var errResp *errcode.ErrorResponse
+		if !errors.As(err, &errResp) {
+			t.Fatalf("ParseErrorResponse() error = %v, want an *errcode.ErrorResponse", err)
+		}
+		// the HTTP date has one-second resolution and time passes between the
+		// handler and the check
+		if errResp.RetryAfter <= 0 || errResp.RetryAfter > want {
+			t.Errorf("ParseErrorResponse() RetryAfter = %v, want in (0, %v]", errResp.RetryAfter, want)
+		}
+	})
 }
 
 func TestIsErrorCode(t *testing.T) {
