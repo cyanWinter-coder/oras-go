@@ -515,6 +515,21 @@ changes:
   already on disk does not lose it.
   Unreachable blobs modified less than an hour before `GC` are reclaimed on a
   subsequent `GC` after the grace window expires.
+- `oci.Store.GC` computes reachability from one read-only snapshot of the
+  references, so a tag, the manifests it names, and their configs and layers
+  are never taken from different generations. Reaching that state is now
+  recoverable: the blobs chosen for removal are moved from `blobs/` into
+  `gc-staging/` before the rebuilt `index.json` is written, the references
+  recorded in `index.json` are checked again and anything referenced again is
+  moved back, and the removal is committed before the blobs are deleted. A
+  failure before the commit restores every staged blob and leaves the store as
+  it was, so `GC` can be retried; content that another `Store` on the same
+  directory tags during the collection is kept. A collection interrupted before
+  committing is rolled back when the store is opened again, and one interrupted
+  after committing has its removal finished then. `GC` still overwrites
+  `index.json` with this `Store`'s references, as before, so tags written by
+  another `Store` since this one was opened are dropped and must be written
+  again.
 
 ## Major additions in v3
 

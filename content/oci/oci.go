@@ -26,7 +26,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sync"
@@ -195,6 +194,12 @@ func NewWithContext(ctx context.Context, root string) (*Store, error) {
 
 	if err := ensureDir(filepath.Join(rootAbs, ocispec.ImageBlobsDir)); err != nil {
 		return nil, err
+	}
+	// Content staged by a collection that failed or was interrupted is not
+	// reachable through index.json yet, so it is restored (or its committed
+	// removal is finished) before the index is loaded.
+	if err := recoverGCStaging(rootAbs); err != nil {
+		return nil, fmt.Errorf("failed to recover interrupted garbage collection: %w", err)
 	}
 	if err := store.ensureOCILayoutFile(); err != nil {
 		return nil, fmt.Errorf("invalid OCI Image Layout: %w", err)
@@ -688,133 +693,137 @@ func (s *Store) writeIndexFile() error {
 //   - garbage blobs in the storage whose metadata is not stored in Store
 //   - temporary files left behind by interrupted blob and metadata writes
 //
+// The rebuilt index replaces the one on disk, whatever AutoSaveIndex says, but
+// the content that index.json still references when the removal is about to be
+// committed is kept rather than deleted. A removal made only in memory, without
+// saving, is therefore completed by a later GC after SaveIndex is called.
+//
 // Unreachable blobs and temporary files modified within the last hour are kept,
 // so blobs pushed by a multi-step copy (for example, layers pushed before their
 // manifest is pushed and tagged) or by another Store on the same directory are
 // not removed while the operation completes within that window. What a kept
 // manifest pushed through this Store references is kept with it, whatever its
 // modification time, so that a copy which skipped pushing a layer already on
-// disk does not lose it. GC does not otherwise coordinate with concurrent
-// writers: it rebuilds the index from this Store's in-memory references and
-// overwrites index.json, which drops tags and manifests written by another
-// Store since this Store was opened, and does not protect writes that take
-// longer than the grace period, nor existing blobs that a copy skips pushing
-// unless the manifest referencing them was pushed through this Store, since
-// their modification time is not refreshed.
+// disk does not lose it.
+//
+// GC computes reachability from a single read-only snapshot of the references,
+// so a tag, the manifests it names, and their configs and layers are never
+// mixed across generations. Removal has three steps: the chosen blobs are first
+// moved out of `blobs/` into `gc-staging/`, then the current references are
+// rechecked and anything referenced again is moved back, and only then is the
+// removal committed and the blobs deleted. Until the commit, a failure restores
+// every staged blob, so the store keeps its previous visibility and GC can be
+// retried.
+//
+// A collection that is interrupted before committing is restored when the
+// Store is next opened, and one that is interrupted after committing has its
+// removal finished then, so repeated GC calls are idempotent. The staging
+// directory is in the root of the layout, outside `blobs/`, so `Exists`,
+// `Fetch`, and `Resolve` are unchanged. GC still does not coordinate with
+// concurrent writers beyond that: it rebuilds the index from this Store's
+// in-memory references and overwrites index.json, which drops tags and
+// manifests written by another Store since this Store was opened, and it does
+// not protect writes that take longer than the grace period, nor existing
+// blobs that a copy skips pushing unless the manifest referencing them was
+// pushed through this Store, since their modification time is not refreshed.
 func (s *Store) GC(ctx context.Context) error {
 	s.sync.Lock()
 	defer s.sync.Unlock()
 
-	// get reachable nodes by reloading the index
-	tagResolver, newGraph, err := s.gcIndex(ctx)
+	// Finish or roll back a collection that was interrupted before this one, so
+	// that repeated GC calls are idempotent and a stale staging directory
+	// cannot hide content the current index references.
+	if err := recoverGCStaging(s.root); err != nil {
+		return fmt.Errorf("unable to recover interrupted garbage collection: %w", err)
+	}
+
+	// Freeze the references and the graph once, so that every reachability
+	// decision of this collection comes from the same generation.
+	snap := s.takeGCSnapshot(ctx)
+
+	// Rebuild the metadata of the snapshot without applying it.
+	tagResolver, newGraph, err := gcReachable(ctx, snap.fetcher, snap.refs)
 	if err != nil {
 		return fmt.Errorf("unable to reload index: %w", err)
 	}
-	// replace the resolver and graph only once the index is saved, so that a
-	// failed save leaves the store as it was
-	if s.AutoSaveIndex {
-		if err := s.saveIndexFrom(tagResolver); err != nil {
-			return fmt.Errorf("unable to save index: %w", err)
-		}
-	}
-	oldGraph := s.graph
-	s.tagResolver = tagResolver
-	s.graph = newGraph
-	reachableNodes := s.graph.DigestSet()
 
-	// clean up garbage blobs in the storage
-	stale := olderThan(leftoverExpiry)
-	rootpath := filepath.Join(s.root, ocispec.ImageBlobsDir)
-	algDirs, err := os.ReadDir(rootpath)
+	// Inspect the layout against the snapshot without modifying any file. The
+	// spared manifests are indexed into newGraph here, before it is installed.
+	plan, err := s.planGC(ctx, snap, newGraph)
 	if err != nil {
 		return err
 	}
-	stalePaths := make(map[digest.Digest]string)
-	var sparedManifests []ocispec.Descriptor
-	for _, algDir := range algDirs {
-		if !algDir.IsDir() {
-			continue
-		}
-		alg := algDir.Name()
-		// skip unsupported directories
-		if !descriptor.IsSupportedAlgorithm(digest.Algorithm(alg)) {
-			continue
-		}
-		algPath := path.Join(rootpath, alg)
-		digestEntries, err := os.ReadDir(algPath)
-		if err != nil {
-			return err
-		}
-		for _, digestEntry := range digestEntries {
-			if err := isContextDone(ctx); err != nil {
-				return err
-			}
-			if digestEntry.IsDir() {
-				continue
-			}
-			dgst := digestEntry.Name()
-			blobDigest := digest.NewDigestFromEncoded(digest.Algorithm(alg), dgst)
-			if err := blobDigest.Validate(); err != nil {
-				// skip irrelevant content
-				continue
-			}
-			if !reachableNodes.Contains(blobDigest) {
-				if stale(digestEntry) {
-					// the blob does not exist in Store, so collect it for
-					// removal once the spared manifests are known
-					stalePaths[blobDigest] = path.Join(algPath, dgst)
-				} else if desc, ok := oldGraph.Node(blobDigest); ok {
-					// keep spared blobs indexed so Predecessors still sees
-					// manifests pushed before GC
-					if err := s.graph.Index(ctx, s.storage, desc); err != nil {
-						return err
-					}
-					if descriptor.IsManifest(desc) {
-						// keep the digest reference so Resolve does not fall
-						// back to an untyped blob descriptor
-						if err := s.tagResolver.Tag(ctx, deleteAnnotationRefName(desc), blobDigest.String()); err != nil {
-							return err
-						}
-						sparedManifests = append(sparedManifests, desc)
-					}
-				}
-			}
+
+	// Take the planned content out of reach before the index that stops
+	// referencing it is written. Staging restores everything it moved if it
+	// fails, so the failed collection leaves the content as visible as it was.
+	staged, err := s.stageGC(ctx, plan.remove)
+	if err != nil {
+		return err
+	}
+
+	// A blob may have been referenced again after the snapshot: another Store
+	// on the same directory may have tagged it, or the references may have been
+	// saved since. Recheck the references recorded in index.json while every
+	// staged blob can still be read, and restore what is now reachable.
+	keep, keptDescs, err := s.gcRecheckReferenced(ctx, snap, staged)
+	if err != nil {
+		return errors.Join(err, staged.restoreAll())
+	}
+	if err := staged.restoreDigests(keep); err != nil {
+		return errors.Join(err, staged.restoreAll())
+	}
+
+	// Save the rebuilt index of this generation while the staged content is
+	// out of reach. A failure restores the staged blobs and leaves the current
+	// resolver, graph, and index as they were, so the store is unchanged.
+	if s.AutoSaveIndex {
+		if err := s.saveIndexFrom(tagResolver); err != nil {
+			return errors.Join(fmt.Errorf("unable to save index: %w", err), staged.restoreAll())
 		}
 	}
 
-	// A spared manifest is kept on its own modification time, but a blob it
-	// references is judged on that blob's: a copy that finds a layer already on
-	// disk skips pushing it, so the layer can be stale while the manifest is
-	// not. Keep it too, or tagging the manifest later leaves content missing.
-	if len(stalePaths) > 0 && len(sparedManifests) > 0 {
-		referenced := graph.NewMemory()
-		if err := referenced.IndexAll(ctx, s.storage, sparedManifests...); err != nil {
-			return err
-		}
-		for dgst := range referenced.DigestSet() {
-			delete(stalePaths, dgst)
+	// Replace the resolver and graph now that the index of this generation is
+	// saved. A failure after this point leaves metadata that already matches
+	// the saved index, so the store remains consistent.
+	s.tagResolver = tagResolver
+	s.graph = newGraph
+
+	// Record the spared manifests, and the manifests the recheck restored, in
+	// the resolver. They are a change after the save above, so index.json lacks
+	// their digest entries until the next save.
+	restored := keepDescriptors(snap, keep, keptDescs)
+	for _, desc := range plan.spared {
+		if err := s.tagResolver.Tag(ctx, deleteAnnotationRefName(desc), desc.Digest.String()); err != nil {
+			return errors.Join(err, staged.restoreAll())
 		}
 	}
-	for _, blobPath := range stalePaths {
-		if err := isContextDone(ctx); err != nil {
-			return err
-		}
-		if err := os.Remove(blobPath); err != nil {
-			return fmt.Errorf("unable to remove %s: %w", blobPath, err)
+	for _, desc := range restored {
+		if err := s.tagResolver.Tag(ctx, deleteAnnotationRefName(desc), desc.Digest.String()); err != nil {
+			return errors.Join(err, staged.restoreAll())
 		}
 	}
 
-	// Re-tagging the spared manifests changed the resolver after the index was
-	// saved above, so index.json lacks their digest entries until the next
-	// save. Write them now, so that the index lists every manifest the store
-	// holds, as it does after any other operation.
-	//
-	// This is opportunistic, like reclaiming leftovers: the collection above
-	// has already removed blobs, so a failed save must not turn a completed GC
-	// into a failed one. The entries stay pending in the collection and are
-	// written by the next save, and without AutoSaveIndex that is SaveIndex.
-	if len(sparedManifests) > 0 && s.AutoSaveIndex {
+	// The commit marks the point at which the removal becomes durable. A
+	// failure here restores the staged blobs, while a failure after it is
+	// finished by recovery when the store is opened next.
+	if err := staged.commit(); err != nil {
+		return errors.Join(err, staged.restoreAll())
+	}
+
+	// Write the digest entries of the spared and restored manifests. This is
+	// opportunistic, like reclaiming leftovers: the collection has already
+	// committed, so a failed save must not turn a completed GC into a failed
+	// one. The entries stay pending in the collection and are written by the
+	// next save, and without AutoSaveIndex that is SaveIndex.
+	if len(plan.spared)+len(keep) > 0 && s.AutoSaveIndex {
 		_ = s.saveIndexFrom(s.tagResolver)
+	}
+
+	if err := staged.remove(); err != nil {
+		// The removal was committed, so the content stays out of reach. A later
+		// collection finishes reclaiming it.
+		return err
 	}
 
 	// Reclaiming leftovers is opportunistic: the collection above has already
@@ -822,6 +831,27 @@ func (s *Store) GC(ctx context.Context) error {
 	// successful GC into a failed one.
 	s.gcLeftovers()
 	return nil
+}
+
+// keepDescriptors returns the descriptors of the manifests among the digests
+// that the pre-commit recheck restored, preferring the descriptor that the
+// recheck read from index.json and falling back to the one the snapshot's
+// graph recorded. A digest with no known descriptor is skipped: it still has
+// its blob back, and its digest entry is written by the next save.
+func keepDescriptors(snap *gcSnapshot, keep set.Set[digest.Digest], recorded map[digest.Digest]ocispec.Descriptor) []ocispec.Descriptor {
+	var descs []ocispec.Descriptor
+	for dgst := range keep {
+		if desc, ok := recorded[dgst]; ok {
+			if descriptor.IsManifest(desc) {
+				descs = append(descs, desc)
+			}
+			continue
+		}
+		if desc, ok := snap.nodes.Node(dgst); ok && descriptor.IsManifest(desc) {
+			descs = append(descs, desc)
+		}
+	}
+	return descs
 }
 
 // leftoverExpiry is how long an unreachable blob or temporary file must have
@@ -884,12 +914,6 @@ func removeFiles(dir string, match func(entry fs.DirEntry) bool) {
 		}
 		_ = os.Remove(filepath.Join(dir, entry.Name()))
 	}
-}
-
-// gcIndex reloads the index and returns the rebuilt metadata without applying
-// it. Information of untagged blobs are cleaned and only tagged blobs remain.
-func (s *Store) gcIndex(ctx context.Context) (*resolver.Memory, *graph.Memory, error) {
-	return gcReachable(ctx, s.storage, s.tagResolver.Map())
 }
 
 // gcReachable is the rule that decides which content a Store keeps when it is
