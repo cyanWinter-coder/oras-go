@@ -33,9 +33,28 @@ import (
 	"github.com/oras-project/oras-go/v3/internal/ioutil"
 )
 
-// tarDirectory walks the directory specified by path, and tar those files with a new
-// path prefix.
-func tarDirectory(ctx context.Context, root, prefix string, w io.Writer, modTime *time.Time, buf []byte) (err error) {
+// tarDirectory walks the directory specified by path, and tars those files with
+// a new path prefix.
+//
+// The walk is split into two phases sharing one frozen snapshot: the snapshot
+// phase enumerates and validates every entry, and the write phase re-validates
+// each entry against the snapshot before reading it. An entry that changes in
+// between makes the function fail with [ErrFileChanged] instead of producing a
+// layer whose descriptor does not match its content.
+func tarDirectory(ctx context.Context, root, prefix string, w io.Writer, modTime *time.Time, buf []byte) error {
+	entries, err := takeSnapshot(ctx, root, prefix, nil)
+	if err != nil {
+		return err
+	}
+	return writeTarSnapshot(ctx, entries, w, modTime, buf)
+}
+
+// writeTarSnapshot emits the frozen snapshot as a tar stream. Each entry is
+// re-validated against its on-disk state immediately before it is read, so the
+// written header and bytes always come from the same validated read. Regular
+// files are opened without following a final symbolic link, and the number of
+// bytes copied is checked against the frozen size.
+func writeTarSnapshot(ctx context.Context, entries []snapshotEntry, w io.Writer, modTime *time.Time, buf []byte) (err error) {
 	tw := tar.NewWriter(w)
 	defer func() {
 		closeErr := tw.Close()
@@ -44,75 +63,96 @@ func tarDirectory(ctx context.Context, root, prefix string, w io.Writer, modTime
 		}
 	}()
 
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) (returnErr error) {
-		if err != nil {
-			return err
-		}
-
+	for _, entry := range entries {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		// Rename path
-		name, err := filepath.Rel(root, path)
-		if err != nil {
+		if err := validateSnapshotEntry(entry); err != nil {
 			return err
 		}
-		name = filepath.Join(prefix, name)
-		name = filepath.ToSlash(name)
 
-		// Generate header
-		// NOTE: We don't support hard links and treat it as regular files
-		var link string
-		mode := info.Mode()
-		if mode&os.ModeSymlink != 0 {
-			if link, err = os.Readlink(path); err != nil {
-				return err
-			}
-		}
-		header, err := tar.FileInfoHeader(info, link)
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		header.Name = name
-		header.Uid = 0
-		header.Gid = 0
-		header.Uname = ""
-		header.Gname = ""
-
+		header := entry.header
 		if modTime != nil {
-			if header.ModTime.After(*modTime) {
-				header.ModTime = *modTime
+			// Do not mutate the shared snapshot header.
+			cloned := *header
+			if cloned.ModTime.After(*modTime) {
+				cloned.ModTime = *modTime
 			}
-			header.AccessTime = header.ModTime
-			header.ChangeTime = header.ModTime
+			cloned.AccessTime = cloned.ModTime
+			cloned.ChangeTime = cloned.ModTime
+			header = &cloned
 		}
 
-		// Write file
 		if err := tw.WriteHeader(header); err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}
-		if mode.IsRegular() {
-			fp, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer func() {
-				closeErr := fp.Close()
-				if returnErr == nil {
-					returnErr = closeErr
-				}
-			}()
 
-			if _, err := ioutil.CopyWithBuffer(tw, fp, buf); err != nil {
-				return fmt.Errorf("failed to copy to %s: %w", path, err)
-			}
+		if !entry.info.Mode().IsRegular() {
+			continue
 		}
 
-		return nil
-	})
+		if err := copySnapshotEntry(tw, entry, buf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSnapshotEntry confirms the on-disk entry still matches what was
+// frozen in the snapshot. A missing entry or any change in type, size,
+// modification time or inode identity fails the whole pack with
+// [ErrFileChanged], since the descriptor can no longer be trusted to describe
+// the content about to be written.
+func validateSnapshotEntry(entry snapshotEntry) error {
+	current, err := os.Lstat(entry.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s: %w", entry.path, ErrFileChanged)
+		}
+		return err
+	}
+	if !entryUnchanged(entry, current) {
+		return fmt.Errorf("%s: %w", entry.path, ErrFileChanged)
+	}
+	return nil
+}
+
+// copySnapshotEntry copies the content of a regular-file snapshot entry into
+// the tar writer from a single, validated read. The file is opened without
+// following a final symbolic link and the copied byte count must equal the
+// frozen size, otherwise the entry is considered to have changed.
+func copySnapshotEntry(tw *tar.Writer, entry snapshotEntry, buf []byte) error {
+	fp, err := openNoFollow(entry.path)
+	if err != nil {
+		if os.IsNotExist(err) || isSymlinkNoFollowError(err) {
+			return fmt.Errorf("%s: %w", entry.path, ErrFileChanged)
+		}
+		return err
+	}
+	defer func() {
+		_ = fp.Close() // read-only handle; close errors are not actionable
+	}()
+
+	// A symbolic link swapped in after the Lstat check is rejected here on
+	// platforms that support O_NOFOLLOW; elsewhere the check above is relied on.
+	if fi, statErr := fp.Stat(); statErr != nil {
+		return statErr
+	} else if !entryUnchanged(entry, fi) {
+		return fmt.Errorf("%s: %w", entry.path, ErrFileChanged)
+	}
+
+	n, err := ioutil.CopyWithBuffer(tw, fp, buf)
+	if err != nil {
+		return fmt.Errorf("failed to copy to %s: %w", entry.path, err)
+	}
+	if n != entry.info.Size() {
+		return fmt.Errorf("%s: size %d does not match snapshot size %d: %w",
+			entry.path, n, entry.info.Size(), ErrFileChanged)
+	}
+	return nil
 }
 
 // extractTarGzip decompresses the gzip

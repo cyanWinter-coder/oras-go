@@ -33,12 +33,18 @@ import (
 )
 
 func Test_tarDirectory(t *testing.T) {
-	setup := func(t *testing.T) (tmpdir string, gz *os.File, gw *gzip.Writer) {
-		tmpdir = t.TempDir()
+	setup := func(t *testing.T) (root string, gz *os.File, gw *gzip.Writer) {
+		tmpdir := t.TempDir()
+		// the source tree is packed on its own so the archive written beside
+		// it cannot be snapshotted as part of the packed root
+		root = filepath.Join(tmpdir, "src")
+		if err := os.MkdirAll(root, 0777); err != nil {
+			t.Fatal(err)
+		}
 
 		paths := []string{
-			filepath.Join(tmpdir, "file1.txt"),
-			filepath.Join(tmpdir, "file2.txt"),
+			filepath.Join(root, "file1.txt"),
+			filepath.Join(root, "file2.txt"),
 		}
 
 		for _, p := range paths {
@@ -53,7 +59,7 @@ func Test_tarDirectory(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		return tmpdir, gz, gzip.NewWriter(gz)
+		return root, gz, gzip.NewWriter(gz)
 	}
 
 	t.Run("success", func(t *testing.T) {

@@ -136,6 +136,15 @@ type Store struct {
 	// disregarding the active umask, similar to tar's `--preserve-permissions`
 	PreservePermissions bool
 
+	// IgnoreRules decides which entries [Store.Add] excludes when packing a
+	// directory. It is invoked with the slash-separated archive path of an
+	// entry, relative to the packed root, and the entry's file info. When it
+	// returns true the entry is skipped; skipping a directory skips its whole
+	// subtree. The rules are evaluated while the packing snapshot is taken,
+	// before any layer content is written, so ignores always apply to a single
+	// frozen view of the tree. A nil IgnoreRules packs every entry.
+	IgnoreRules IgnoreFunc
+
 	workingDir      string           // the working directory of the file store
 	digestAlgorithm digest.Algorithm // the algorithm for digests computed by Add
 	closed          int32            // if the store is closed - 0: false, 1: true.
@@ -703,9 +712,27 @@ func (s *Store) tarModTime() *time.Time {
 }
 
 // descriptorFromDir generates descriptor from the given directory.
+//
+// The directory is packed through an explicit, linear state chain:
+//
+//  1. a snapshot is taken, freezing the entry list together with the ignore
+//     rules, symbolic-link containment and duplicate-path validation;
+//  2. the frozen snapshot is written into the layer in one pass, with every
+//     entry re-validated against disk immediately before it is read, so the
+//     layer bytes, its digest and its size all come from the same read;
+//  3. only a fully written layer is published into the store and referenced by
+//     the returned descriptor. Any failure, including context cancellation,
+//     removes the temporary layer and releases its handle, so no half-written
+//     layer is ever observable.
 func (s *Store) descriptorFromDir(ctx context.Context, name, mediaType, dir string) (desc ocispec.Descriptor, err error) {
 	// the walk does not descend into a root that is a symlink
 	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+
+	// Phase 1: freeze the entry list. Nothing is written until this succeeds.
+	entries, err := takeSnapshot(ctx, dir, name, s.IgnoreRules)
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
@@ -715,28 +742,29 @@ func (s *Store) descriptorFromDir(ctx context.Context, name, mediaType, dir stri
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
+	gzPath := gz.Name()
+	// On failure the temporary layer must not survive and its handle must not
+	// leak. A successful return closes the handle below instead.
+	completed := false
 	defer func() {
-		closeErr := gz.Close()
-		if err == nil {
-			err = closeErr
+		if completed {
+			return
 		}
+		_ = gz.Close()
+		s.removeTempFile(gzPath)
 	}()
 
-	// compress the directory
+	// compress the snapshot
 	gzDigester := s.digestAlgorithm.Digester()
 	gzw := gzip.NewWriter(io.MultiWriter(gz, gzDigester.Hash()))
-	defer func() {
-		closeErr := gzw.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
 	tarDigester := s.digestAlgorithm.Digester()
 	tw := io.MultiWriter(gzw, tarDigester.Hash())
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	if err := tarDirectory(ctx, dir, name, tw, s.tarModTime(), *buf); err != nil {
+
+	// Phase 2: write the layer from the single frozen read.
+	if err := writeTarSnapshot(ctx, entries, tw, s.tarModTime(), *buf); err != nil {
+		_ = gzw.Close() // release the writer before the temp layer is removed
 		return ocispec.Descriptor{}, fmt.Errorf("failed to tar %s: %w", dir, err)
 	}
 
@@ -752,10 +780,16 @@ func (s *Store) descriptorFromDir(ctx context.Context, name, mediaType, dir stri
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
+	if err := gz.Close(); err != nil {
+		return ocispec.Descriptor{}, err
+	}
 
-	// map gzip digest to gzip path
+	// Phase 3: publish the finished layer. The descriptor digest and size
+	// describe exactly the bytes written above, so the manifest can never
+	// reference a different layer than the one stored.
 	gzDigest := gzDigester.Digest()
-	s.digestToPath.Store(gzDigest, gz.Name())
+	s.digestToPath.Store(gzDigest, gzPath)
+	completed = true
 
 	// generate descriptor
 	if mediaType == "" {
@@ -776,10 +810,27 @@ func (s *Store) descriptorFromDir(ctx context.Context, name, mediaType, dir stri
 	}, nil
 }
 
-// descriptorFromFile generates descriptor from the given file.
+// removeTempFile deletes a temporary layer file and drops it from the
+// temporary-file index. A missing file is not an error.
+func (s *Store) removeTempFile(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Keep the index entry so Store.Close still attempts the removal.
+		return
+	}
+	s.tmpFiles.Delete(path)
+}
+
+// descriptorFromFile generates descriptor from the given file. The file is
+// opened without following a final symbolic link and re-validated against the
+// caller-provided file info, so a file replaced between the caller's stat and
+// this read fails with [ErrFileChanged] instead of producing a descriptor that
+// does not match the read content.
 func (s *Store) descriptorFromFile(fi os.FileInfo, mediaType, path string) (desc ocispec.Descriptor, err error) {
-	fp, err := os.Open(path)
+	fp, err := openNoFollow(path)
 	if err != nil {
+		if os.IsNotExist(err) || isSymlinkNoFollowError(err) {
+			return ocispec.Descriptor{}, fmt.Errorf("%s: %w", path, ErrFileChanged)
+		}
 		return ocispec.Descriptor{}, err
 	}
 	defer func() {
@@ -788,6 +839,17 @@ func (s *Store) descriptorFromFile(fi os.FileInfo, mediaType, path string) (desc
 			err = closeErr
 		}
 	}()
+
+	// Re-validate through the opened handle: on platforms with O_NOFOLLOW this
+	// cannot be a symbolic link, and the inode/size/mode must still match.
+	current, err := fp.Stat()
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !sameFile(fi, current) ||
+		current.Mode() != fi.Mode() || current.Size() != fi.Size() {
+		return ocispec.Descriptor{}, fmt.Errorf("%s: %w", path, ErrFileChanged)
+	}
 
 	dgst, err := s.digestAlgorithm.FromReader(fp)
 	if err != nil {
@@ -804,7 +866,7 @@ func (s *Store) descriptorFromFile(fi os.FileInfo, mediaType, path string) (desc
 	return ocispec.Descriptor{
 		MediaType: mediaType,
 		Digest:    dgst,
-		Size:      fi.Size(),
+		Size:      current.Size(),
 	}, nil
 }
 

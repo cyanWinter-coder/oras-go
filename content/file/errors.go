@@ -24,6 +24,25 @@ var (
 	ErrOverwriteDisallowed     = errors.New("overwrite disallowed")
 	ErrStoreClosed             = errors.New("store already closed")
 	ErrInvalidStoreOptions     = errors.New("invalid store options")
+
+	// ErrFileChanged is returned by [Store.Add] when a file or directory is
+	// modified, replaced or deleted between the moment its packing snapshot is
+	// taken and the moment its content is read into the layer. The descriptor of
+	// such a layer cannot be trusted to match the packed content, so packing
+	// fails instead of publishing it. Re-run [Store.Add] against a stable tree.
+	ErrFileChanged = errors.New("file changed during packing")
+
+	// ErrDuplicatePath is returned by [Store.Add] when two entries in the
+	// packed tree map to the same archive path. This can only be caused by a
+	// race while the snapshot is taken (for example an entry is renamed onto an
+	// existing path), since a clean directory tree has unique paths.
+	ErrDuplicatePath = errors.New("duplicate path in packing snapshot")
+
+	// ErrSymlinkEscapes is returned by [Store.Add] when a symbolic link in the
+	// packed tree points outside the packed root, either through an absolute
+	// target or through a ".." traversal. Such a link cannot be validated to
+	// stay inside the tree and is rejected before any layer content is written.
+	ErrSymlinkEscapes = errors.New("symbolic link escapes the packing root")
 )
 
 var errSkipUnnamed = errors.New("unnamed descriptor skipped")
