@@ -28,7 +28,9 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -278,6 +280,262 @@ func TestStorage_Push_Concurrent(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Errorf("Storage.Fetch() = %v, want %v", got, content)
+	}
+}
+
+// blockingReader holds the first Read until release is closed, so a test can
+// keep a push's ingest phase in flight while other callers join it.
+type blockingReader struct {
+	data    []byte
+	pos     int
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { <-r.release })
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// countIngestFiles returns the number of files currently in the ingest dir.
+func countIngestFiles(t *testing.T, s *Storage) int {
+	t.Helper()
+	entries, err := os.ReadDir(s.ingestRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("ReadDir(%s) error = %v", s.ingestRoot, err)
+	}
+	return len(entries)
+}
+
+// waitFor polls cond until true or a timeout elapses.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition was not met in time")
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestStorage_Push_SingleFlightSharesWrite(t *testing.T) {
+	blob := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+	}
+
+	tempDir := t.TempDir()
+	s, err := NewStorage(tempDir)
+	if err != nil {
+		t.Fatal("New() error =", err)
+	}
+	ctx := context.Background()
+
+	// Hold the leader's ingest in flight.
+	release := make(chan struct{})
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_ = s.Push(ctx, desc, &blockingReader{data: blob, release: release})
+	}()
+	waitFor(t, func() bool { return countIngestFiles(t, s) == 1 })
+	ingestDuringFlight := countIngestFiles(t, s)
+
+	// Waiters join while the leader's write is in flight.
+	const waiters = 16
+	var wg sync.WaitGroup
+	errs := make([]error, waiters)
+	for i := range waiters {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.Push(ctx, desc, &blockingReader{data: blob, release: release})
+		}(i)
+	}
+	// Let the waiters subscribe, then release the shared write. A waiter that
+	// only reaches Push after the leader committed legitimately becomes the
+	// next caller and gets ErrAlreadyExists; either way it never opens a
+	// second concurrent ingest.
+	waitFor(t, func() bool { return inFlightStoragePushes() >= 1 })
+	close(release)
+	wg.Wait()
+	select {
+	case <-leaderDone:
+	case <-time.After(time.Second):
+		t.Fatal("leader push never completed")
+	}
+
+	// The whole group produced a single ingest and leaves none behind.
+	if ingestDuringFlight != 1 {
+		t.Errorf("ingest files during flight = %d, want 1", ingestDuringFlight)
+	}
+	if countIngestFiles(t, s) != 0 {
+		t.Errorf("ingest files after commit = %d, want 0", countIngestFiles(t, s))
+	}
+
+	for i, err := range errs {
+		if err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+			t.Errorf("waiter %d error = %v, want nil or ErrAlreadyExists", i, err)
+		}
+	}
+
+	// exactly one committed blob exists, regardless of how the calls were
+	// scheduled, and it is complete and verifiable.
+	rel, err := blobPath(desc.Digest)
+	if err != nil {
+		t.Fatalf("blobPath() error = %v", err)
+	}
+	blobPath := filepath.Join(s.root, rel)
+	if fi, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("committed blob stat error = %v", err)
+	} else if fi.Size() != desc.Size {
+		t.Errorf("committed blob size = %d, want %d", fi.Size(), desc.Size)
+	}
+	exists, err := s.Exists(ctx, desc)
+	if err != nil {
+		t.Fatal("Storage.Exists() error =", err)
+	}
+	if !exists {
+		t.Fatal("Storage.Exists() = false, want true")
+	}
+	if err := content.Verify(ctx, s, desc); err != nil {
+		t.Errorf("content.Verify() error = %v", err)
+	}
+}
+
+// inFlightStoragePushes counts goroutines parked inside Storage.Push by
+// inspecting all goroutine stacks for the Flight.Do frame.
+func inFlightStoragePushes() int {
+	buf := make([]byte, 1<<16)
+	n := runtime.Stack(buf, true)
+	for n == len(buf) {
+		buf = make([]byte, len(buf)*2)
+		n = runtime.Stack(buf, true)
+	}
+	return bytes.Count(buf[:n], []byte("syncutil.(*Flight[...]).Do"))
+}
+
+func TestStorage_Push_FailureCleansIngestAndAllowsRetry(t *testing.T) {
+	blob := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+	}
+
+	tempDir := t.TempDir()
+	s, err := NewStorage(tempDir)
+	if err != nil {
+		t.Fatal("New() error =", err)
+	}
+	ctx := context.Background()
+
+	// a short write fails verification.
+	if err := s.Push(ctx, desc, strings.NewReader("short")); err == nil {
+		t.Fatal("Storage.Push() with short content error = nil, want error")
+	}
+	if countIngestFiles(t, s) != 0 {
+		t.Errorf("ingest files after failed push = %d, want 0", countIngestFiles(t, s))
+	}
+	exists, err := s.Exists(ctx, desc)
+	if err != nil {
+		t.Fatal("Storage.Exists() error =", err)
+	}
+	if exists {
+		t.Fatal("Storage.Exists() = true after failed push, want false")
+	}
+
+	// the failure is a terminal state: the correct content can be committed.
+	if err := s.Push(ctx, desc, bytes.NewReader(blob)); err != nil {
+		t.Fatalf("retry Storage.Push() error = %v", err)
+	}
+	exists, err = s.Exists(ctx, desc)
+	if err != nil {
+		t.Fatal("Storage.Exists() error =", err)
+	}
+	if !exists {
+		t.Error("Storage.Exists() = false after retry, want true")
+	}
+	if err := content.Verify(ctx, s, desc); err != nil {
+		t.Errorf("content.Verify() error = %v", err)
+	}
+}
+
+func TestStorage_Push_InvalidDigest(t *testing.T) {
+	tempDir := t.TempDir()
+	s, err := NewStorage(tempDir)
+	if err != nil {
+		t.Fatal("New() error =", err)
+	}
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    "not-a-valid-digest",
+		Size:      5,
+	}
+	if err := s.Push(context.Background(), desc, strings.NewReader("hello")); !errors.Is(err, errdef.ErrInvalidDigest) {
+		t.Errorf("Storage.Push() error = %v, want ErrInvalidDigest", err)
+	}
+}
+
+func TestStorage_Push_InFlightRecheckFindsCommittedBlob(t *testing.T) {
+	blob := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+	}
+
+	tempDir := t.TempDir()
+	s, err := NewStorage(tempDir)
+	if err != nil {
+		t.Fatal("New() error =", err)
+	}
+	ctx := context.Background()
+
+	// hold a push in flight so a concurrent caller joins the same entry.
+	release := make(chan struct{})
+	flightDone := make(chan struct{})
+	go func() {
+		defer close(flightDone)
+		_ = s.Push(ctx, desc, &blockingReader{data: blob, release: release})
+	}()
+	waitFor(t, func() bool { return countIngestFiles(t, s) == 1 })
+
+	// the waiter joins while the leader's ingest is blocked.
+	waiterErr := make(chan error, 1)
+	go func() {
+		waiterErr <- s.Push(ctx, desc, bytes.NewReader(blob))
+	}()
+	waitFor(t, func() bool { return inFlightStoragePushes() >= 1 })
+	close(release)
+
+	select {
+	case <-flightDone:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight push never completed")
+	}
+	select {
+	case err := <-waiterErr:
+		if err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+			t.Errorf("waiter error = %v, want nil or ErrAlreadyExists", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter never returned")
+	}
+
+	if err := content.Verify(ctx, s, desc); err != nil {
+		t.Errorf("content.Verify() error = %v", err)
 	}
 }
 

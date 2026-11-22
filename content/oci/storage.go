@@ -25,9 +25,11 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/oras-project/oras-go/v3/errdef"
 	"github.com/oras-project/oras-go/v3/internal/ioutil"
+	"github.com/oras-project/oras-go/v3/internal/syncutil"
 )
 
 // bufPool is a pool of byte buffers that can be reused for copying content
@@ -57,6 +59,9 @@ type Storage struct {
 	root string
 	// ingestRoot is the root directory of the temporary ingest files.
 	ingestRoot string
+	// flights coalesces concurrent pushes of the same digest so the blob is
+	// ingested and renamed once; waiters share the committed result.
+	flights syncutil.Flight[digest.Digest, struct{}]
 }
 
 // ingestDirName is the name of the directory, in the root of the layout, that
@@ -78,44 +83,58 @@ func NewStorage(root string) (*Storage, error) {
 }
 
 // Push pushes the content, matching the expected descriptor.
-func (s *Storage) Push(_ context.Context, expected ocispec.Descriptor, content io.Reader) error {
+//
+// The content is written to a temporary ingest file and verified against the
+// descriptor before it is renamed into the blob directory, so a failed or
+// cancelled push never leaves a reachable partial blob. Concurrent pushes of
+// the same digest share one ingest-and-commit cycle and observe the same
+// result.
+func (s *Storage) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
 	path, err := blobPath(expected.Digest)
 	if err != nil {
 		return fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrInvalidDigest)
 	}
 	target := filepath.Join(s.root, path)
 
-	// check if the target content already exists in the blob directory.
 	if _, err := os.Stat(target); err == nil {
 		return fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrAlreadyExists)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 
-	if err := ensureDir(filepath.Dir(target)); err != nil {
-		return err
-	}
-
-	// write the content to a temporary ingest file.
-	ingest, err := s.ingest(expected, content)
-	if err != nil {
-		return err
-	}
-
-	// move the content from the temporary ingest file to the target path.
-	// since blobs are read-only once stored, if the target blob already exists,
-	// Rename() will fail for permission denied when trying to overwrite it.
-	if err := os.Rename(ingest, target); err != nil {
-		// remove the ingest file in case of error
-		os.Remove(ingest)
-		if errors.Is(err, os.ErrPermission) {
-			return fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrAlreadyExists)
+	_, err = s.flights.Do(ctx, expected.Digest, func(context.Context) (struct{}, error) {
+		// Re-check inside the coalesced call: a waiter's fast-path Stat may
+		// have run before another in-flight call committed the blob.
+		if _, err := os.Stat(target); err == nil {
+			return struct{}{}, fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrAlreadyExists)
+		} else if !os.IsNotExist(err) {
+			return struct{}{}, err
 		}
 
-		return err
-	}
+		if err := ensureDir(filepath.Dir(target)); err != nil {
+			return struct{}{}, err
+		}
 
-	return nil
+		// write the content to a temporary ingest file.
+		ingest, err := s.ingest(expected, content)
+		if err != nil {
+			return struct{}{}, err
+		}
+
+		// move the content from the temporary ingest file to the target path.
+		// since blobs are read-only once stored, if the target blob already exists,
+		// Rename() will fail for permission denied when trying to overwrite it.
+		if err := os.Rename(ingest, target); err != nil {
+			// remove the ingest file in case of error
+			os.Remove(ingest)
+			if errors.Is(err, os.ErrPermission) {
+				return struct{}{}, fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrAlreadyExists)
+			}
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 // UnsafePush pushes content whose digest or size may be unknown, subject to

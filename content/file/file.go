@@ -257,7 +257,7 @@ func (s *Store) Close() error {
 
 	var errs []string
 	s.tmpFiles.Range(func(name, _ any) bool {
-		if err := os.Remove(name.(string)); err != nil {
+		if err := os.Remove(name.(string)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err.Error())
 		}
 		return true
@@ -556,7 +556,10 @@ func (s *Store) Add(ctx context.Context, name, mediaType, path string) (ocispec.
 	return desc, nil
 }
 
-// saveFile saves content matching the descriptor to the given file.
+// saveFile writes content matching the descriptor to fp and verifies it while
+// copying. It closes fp before returning and performs no index updates: the
+// caller decides when the verified content becomes visible by committing it
+// (renaming it into place) and publishing its descriptor afterwards.
 func (s *Store) saveFile(fp *os.File, expected ocispec.Descriptor, content io.Reader) (err error) {
 	defer func() {
 		closeErr := fp.Close()
@@ -571,13 +574,17 @@ func (s *Store) saveFile(fp *os.File, expected ocispec.Descriptor, content io.Re
 	if err := ioutil.CopyBuffer(fp, content, *buf, expected); err != nil {
 		return fmt.Errorf("failed to copy content to %s: %w", path, err)
 	}
-
-	s.digestToPath.Store(expected.Digest, path)
 	return nil
 }
 
-// pushFile saves content matching the descriptor to the target path.
-func (s *Store) pushFile(target string, expected ocispec.Descriptor, content io.Reader) error {
+// pushFile saves content matching the descriptor to the target path using a
+// visible-on-commit protocol: the content is written and verified in a
+// temporary object next to target, renamed into place only after verification
+// succeeds, and entered into the index last. A failed or cancelled write
+// removes the unreachable temporary object only, so any content already
+// committed at target is never deleted and Fetch can never observe a partial
+// file.
+func (s *Store) pushFile(target string, expected ocispec.Descriptor, content io.Reader) (err error) {
 	if err := ensureDir(filepath.Dir(target)); err != nil {
 		return fmt.Errorf("failed to ensure directories of the target path: %w", err)
 	}
@@ -590,19 +597,45 @@ func (s *Store) pushFile(target string, expected ocispec.Descriptor, content io.
 	if err := removeSymlink(target); err != nil {
 		return err
 	}
-	fp, err := createNoFollow(target, 0666)
-	if err != nil {
-		return fmt.Errorf("failed to create file %s: %w", target, err)
-	}
 
-	if err := s.saveFile(fp, expected, content); err != nil {
-		// Do not leave content that failed verification, or was only partly
-		// written, at the target path, where it looks like a pulled file.
-		if removeErr := os.Remove(target); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return errors.Join(err, fmt.Errorf("failed to remove %s: %w", target, removeErr))
+	// The temporary object lives next to target, so the final rename stays on
+	// one file system and is atomic.
+	tmp, err := s.tempFileIn(filepath.Dir(target))
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file for %s: %w", target, err)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			// Close (a no-op when saveFile already closed it) and remove the
+			// unreachable temporary object. target is never touched here.
+			_ = tmp.Close()
+			if removeErr := os.Remove(tmpPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && err == nil {
+				err = fmt.Errorf("failed to remove temporary file %s: %w", tmpPath, removeErr)
+			}
+			s.tmpFiles.Delete(tmpPath)
 		}
+	}()
+
+	if err := s.saveFile(tmp, expected, content); err != nil {
 		return err
 	}
+
+	// Atomic commit: target holds the complete, verified content only after
+	// the rename succeeds.
+	if err := os.Rename(tmpPath, target); err != nil {
+		return fmt.Errorf("failed to rename temporary file to %s: %w", target, err)
+	}
+	committed = true
+	// The former temporary path is now the committed target, so it must no
+	// longer be treated as removable temporary state, otherwise Close would
+	// delete committed content.
+	s.tmpFiles.Delete(tmpPath)
+
+	// Publish to the index only after the content is committed, so Fetch and
+	// Exists cannot see a descriptor whose blob is not yet in place.
+	s.digestToPath.Store(expected.Digest, target)
 	return nil
 }
 
@@ -676,6 +709,18 @@ func (s *Store) pushDir(name, target string, expected ocispec.Descriptor, checks
 	}
 
 	gzPath := gz.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			// saveFile already closes the file; remove the unreachable gzip
+			// temporary object and unregister it so Close does not revisit it.
+			if removeErr := os.Remove(gzPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && err == nil {
+				err = fmt.Errorf("failed to remove temporary gzip %s: %w", gzPath, removeErr)
+			}
+			s.tmpFiles.Delete(gzPath)
+		}
+	}()
+
 	// the digest of the gz is verified while saving
 	if err := s.saveFile(gz, expected, content); err != nil {
 		return fmt.Errorf("failed to save gzip to %s: %w", gzPath, err)
@@ -684,8 +729,26 @@ func (s *Store) pushDir(name, target string, expected ocispec.Descriptor, checks
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
 	if err := extractTarGzip(target, name, gzPath, checksumKey, checksum, *buf, s.PreservePermissions); err != nil {
+		// Extraction failed, so the directory at target is partial and has
+		// not been committed. Remove the unreachable partial directory so a
+		// later push of the same name starts from an empty target rather than
+		// half-extracted content.
+		if removeErr := os.RemoveAll(target); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(
+				fmt.Errorf("failed to extract tar to %s: %w", target, err),
+				fmt.Errorf("failed to remove partial directory %s: %w", target, removeErr),
+			)
+		}
 		return fmt.Errorf("failed to extract tar to %s: %w", target, err)
 	}
+
+	// The directory is fully extracted and the gzip is verified: only now
+	// publish the descriptor so Fetch cannot observe an incomplete unpack.
+	committed = true
+	// The gzip stays on disk as the backing content for the directory, so it
+	// is no longer removable temporary state.
+	s.tmpFiles.Delete(gzPath)
+	s.digestToPath.Store(expected.Digest, gzPath)
 	return nil
 }
 
@@ -873,7 +936,16 @@ func descriptorName(desc ocispec.Descriptor) string {
 // tempFile creates a temp file with the file name format "oras_file_randomString",
 // and returns the pointer to the temp file.
 func (s *Store) tempFile() (*os.File, error) {
-	tmp, err := os.CreateTemp("", "oras_file_*")
+	return s.tempFileIn("")
+}
+
+// tempFileIn creates a temp file with the file name format
+// "oras_file_randomString" inside dir (the OS temporary directory when dir is
+// empty), and returns the pointer to the temp file. Creating the temporary
+// object next to its eventual target keeps the final rename on one file
+// system, so the commit is atomic.
+func (s *Store) tempFileIn(dir string) (*os.File, error) {
+	tmp, err := os.CreateTemp(dir, "oras_file_*")
 	if err != nil {
 		return nil, err
 	}

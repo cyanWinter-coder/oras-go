@@ -26,11 +26,16 @@ import (
 	contentpkg "github.com/oras-project/oras-go/v3/content"
 	"github.com/oras-project/oras-go/v3/errdef"
 	"github.com/oras-project/oras-go/v3/internal/descriptor"
+	"github.com/oras-project/oras-go/v3/internal/syncutil"
 )
 
 // Memory is a memory based CAS.
 type Memory struct {
 	content sync.Map // map[descriptor.Descriptor][]byte
+	// flights coalesces concurrent pushes of the same descriptor so the
+	// content is read and verified once and every waiter observes the same
+	// committed terminal state.
+	flights syncutil.Flight[descriptor.Descriptor, struct{}]
 }
 
 // NewMemory creates a new Memory CAS.
@@ -49,23 +54,34 @@ func (m *Memory) Fetch(_ context.Context, target ocispec.Descriptor) (io.ReadClo
 }
 
 // Push pushes the content, matching the expected descriptor.
-func (m *Memory) Push(_ context.Context, expected ocispec.Descriptor, content io.Reader) error {
+//
+// Concurrent pushes of the same descriptor are coalesced into one write: the
+// content is read and verified against the descriptor before it is published,
+// and every concurrent caller shares the result. Failed or cancelled writes
+// never publish a partial value, so Fetch can only observe complete content.
+func (m *Memory) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
 	key := descriptor.FromOCI(expected)
+	_, err := m.flights.Do(ctx, key, func(context.Context) (struct{}, error) {
+		// Re-check under the coalesced call: a waiter may have found an
+		// entry created after the fast-path check, or an earlier call may
+		// have committed the content.
+		if _, exists := m.content.Load(key); exists {
+			return struct{}{}, fmt.Errorf("%s: %s: %w", key.Digest, key.MediaType, errdef.ErrAlreadyExists)
+		}
 
-	// check if the content exists in advance to avoid reading from the content.
-	if _, exists := m.content.Load(key); exists {
-		return fmt.Errorf("%s: %s: %w", key.Digest, key.MediaType, errdef.ErrAlreadyExists)
-	}
-
-	// read and try to store the content.
-	value, err := contentpkg.ReadAll(content, expected)
-	if err != nil {
-		return err
-	}
-	if _, exists := m.content.LoadOrStore(key, value); exists {
-		return fmt.Errorf("%s: %s: %w", key.Digest, key.MediaType, errdef.ErrAlreadyExists)
-	}
-	return nil
+		// Read and verify the whole content into a private buffer first. It
+		// is published to the index only after verification succeeds, so a
+		// short write or a digest mismatch leaves no reachable state.
+		value, err := contentpkg.ReadAll(content, expected)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if _, exists := m.content.LoadOrStore(key, value); exists {
+			return struct{}{}, fmt.Errorf("%s: %s: %w", key.Digest, key.MediaType, errdef.ErrAlreadyExists)
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 // Exists returns true if the described content exists.

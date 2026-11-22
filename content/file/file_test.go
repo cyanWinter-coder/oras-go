@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2346,6 +2347,281 @@ func TestStore_File_Push_VerificationFailure_RemovesFile(t *testing.T) {
 				t.Errorf("file content = %q, want %q", got, blob)
 			}
 		})
+	}
+}
+
+// blockingFileReader holds its first Read until release is closed, letting a
+// test keep a file push's temporary-object phase in flight. readStarted is
+// closed on the first Read so the test can wait deterministically until the
+// push has begun consuming the content.
+type blockingFileReader struct {
+	data        []byte
+	pos         int
+	release     chan struct{}
+	readStarted chan struct{}
+	once        sync.Once
+}
+
+func (r *blockingFileReader) Read(p []byte) (int, error) {
+	r.once.Do(func() {
+		close(r.readStarted)
+		<-r.release
+	})
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+func newBlockingFileReader(data []byte, release chan struct{}) *blockingFileReader {
+	return &blockingFileReader{
+		data:        data,
+		release:     release,
+		readStarted: make(chan struct{}),
+	}
+}
+
+// countOrasTempFiles counts the temporary objects the store has registered.
+func countOrasTempFiles(s *Store) int {
+	var n int
+	s.tmpFiles.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func TestStore_File_Push_AtomicCommit_FailureCleansTempOnly(t *testing.T) {
+	name := "test.txt"
+	blob := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+		Annotations: map[string]string{
+			ocispec.AnnotationTitle: name,
+		},
+	}
+
+	tempDir := t.TempDir()
+	s, err := New(tempDir)
+	if err != nil {
+		t.Fatal("Store.New() error =", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// a verification failure removes only the unreachable temporary object.
+	if err := s.Push(ctx, desc, bytes.NewReader([]byte("hello wOrld"))); err == nil {
+		t.Fatal("Store.Push() with mismatched content error = nil, want error")
+	}
+	if countOrasTempFiles(s) != 0 {
+		t.Errorf("registered temporary files = %d, want 0", countOrasTempFiles(s))
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, name)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("target file left behind after failed push, stat error = %v", err)
+	}
+	exists, err := s.Exists(ctx, desc)
+	if err != nil {
+		t.Fatal("Store.Exists() error =", err)
+	}
+	if exists {
+		t.Error("Store.Exists() = true after failed push, want false")
+	}
+	if _, err := s.Fetch(ctx, desc); !errors.Is(err, errdef.ErrNotFound) {
+		t.Errorf("Store.Fetch() error = %v, want ErrNotFound", err)
+	}
+
+	// the failure is a repeatable terminal state: the correct content commits.
+	if err := s.Push(ctx, desc, bytes.NewReader(blob)); err != nil {
+		t.Fatalf("retry Store.Push() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(tempDir, name))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Errorf("committed content = %q, want %q", got, blob)
+	}
+}
+
+func TestStore_File_Push_AtomicCommit_DoesNotDeleteCommittedContent(t *testing.T) {
+	name := "test.txt"
+	blob := []byte("hello world")
+	goodDesc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+		Annotations: map[string]string{
+			ocispec.AnnotationTitle: name,
+		},
+	}
+
+	tempDir := t.TempDir()
+	s, err := New(tempDir)
+	if err != nil {
+		t.Fatal("Store.New() error =", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// commit the real content first.
+	if err := s.Push(ctx, goodDesc, bytes.NewReader(blob)); err != nil {
+		t.Fatalf("Store.Push() error = %v", err)
+	}
+
+	// A later push of the same name with wrong content fails verification. The
+	// temporary object is cleaned up and the previously committed file stays.
+	badDesc := goodDesc
+	badDesc.Digest = digest.FromBytes([]byte("different content"))
+	badDesc.Size = int64(len("different content"))
+	if err := s.Push(ctx, badDesc, bytes.NewReader([]byte("different content"))); err == nil {
+		t.Fatal("Store.Push() with mismatched descriptor error = nil, want error")
+	}
+
+	got, err := os.ReadFile(filepath.Join(tempDir, name))
+	if err != nil {
+		t.Fatalf("committed file removed after failed re-push: %v", err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Errorf("committed content = %q, want %q (must not be deleted)", got, blob)
+	}
+	exists, err := s.Exists(ctx, goodDesc)
+	if err != nil {
+		t.Fatal("Store.Exists() error =", err)
+	}
+	if !exists {
+		t.Error("Store.Exists() = false for committed content, want true")
+	}
+}
+
+func TestStore_File_Push_AtomicCommit_FetchSeesOnlyComplete(t *testing.T) {
+	name := "test.txt"
+	blob := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+		Annotations: map[string]string{
+			ocispec.AnnotationTitle: name,
+		},
+	}
+
+	tempDir := t.TempDir()
+	s, err := New(tempDir)
+	if err != nil {
+		t.Fatal("Store.New() error =", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	release := make(chan struct{})
+	reader := newBlockingFileReader(blob, release)
+	pushDone := make(chan struct{})
+	go func() {
+		defer close(pushDone)
+		_ = s.Push(ctx, desc, reader)
+	}()
+
+	// wait until the push is consuming content and blocked in its temporary
+	// object, then assert the target path is not yet visible on disk. A named
+	// write holds its name lock until commit, so visibility is asserted at the
+	// file-system level here rather than through Exists/Fetch, which take the
+	// same lock.
+	select {
+	case <-reader.readStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("push never started reading")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, name)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("target visible before commit, stat error = %v", err)
+	}
+	// the in-flight data lives only in a temporary object, never at target.
+	if countOrasTempFiles(s) != 1 {
+		t.Errorf("registered temporary files = %d, want 1", countOrasTempFiles(s))
+	}
+
+	close(release)
+	select {
+	case <-pushDone:
+	case <-time.After(time.Second):
+		t.Fatal("push never completed")
+	}
+
+	// after commit, the complete content is fetchable and verifiable.
+	exists, err := s.Exists(ctx, desc)
+	if err != nil {
+		t.Fatal("Store.Exists() error =", err)
+	}
+	if !exists {
+		t.Fatal("Store.Exists() = false after commit, want true")
+	}
+	rc, err := s.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("Store.Fetch() error = %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal("Store.Fetch().Read() error =", err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Errorf("fetched content = %q, want %q", got, blob)
+	}
+}
+
+func TestStore_Dir_Push_FailureCleansPartialDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	s, err := New(tempDir)
+	if err != nil {
+		t.Fatal("Store.New() error =", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// A valid gzip stream whose payload is not a valid tar archive makes
+	// verification of the gzip digest pass but extraction fail after the
+	// target directory is created.
+	payload := []byte("this is not a tar archive, only gzip-compressed bytes")
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	if _, err := zw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	blob := gz.Bytes()
+	const dirName = "brokendir"
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayerGzip,
+		Digest:    digest.FromBytes(blob),
+		Size:      int64(len(blob)),
+		Annotations: map[string]string{
+			ocispec.AnnotationTitle: dirName,
+			AnnotationUnpack:        "true",
+		},
+	}
+
+	if err := s.Push(ctx, desc, bytes.NewReader(blob)); err == nil {
+		t.Fatal("Store.Push() of a corrupt tar.gz error = nil, want error")
+	}
+
+	// the partial, uncommitted directory is removed rather than left behind.
+	if _, err := os.Stat(filepath.Join(tempDir, dirName)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("partial directory left behind after failed extraction, stat error = %v", err)
+	}
+	if countOrasTempFiles(s) != 0 {
+		t.Errorf("registered temporary files = %d, want 0", countOrasTempFiles(s))
+	}
+	exists, err := s.Exists(ctx, desc)
+	if err != nil {
+		t.Fatal("Store.Exists() error =", err)
+	}
+	if exists {
+		t.Error("Store.Exists() = true after failed directory push, want false")
 	}
 }
 
