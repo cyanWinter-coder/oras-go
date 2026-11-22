@@ -208,6 +208,16 @@ func CopyGraph(ctx context.Context, src content.ReadOnlyStorage, dst content.Sto
 
 // copyGraph copies a rooted directed acyclic graph (DAG) from the source CAS to
 // the destination CAS with specified caching, concurrency limiter and tracker.
+//
+// The root descriptor and the descriptors discovered from the (cached) source
+// manifests freeze the graph being copied: content that appears or changes at
+// the source after the copy started is not picked up. The tracker records the
+// real completion state of every node: a node is marked done only when its
+// copy completed while the operation was still active. Once ctx is cancelled,
+// no new uploads are started, and an upload result that lands after the
+// cancellation took effect does not advance the tracker, so parent nodes (and
+// ultimately the root, whose copy triggers tagging) never treat a cancelled
+// graph as fully copied.
 func copyGraph(ctx context.Context, src content.ReadOnlyStorage, dst content.Storage, root ocispec.Descriptor,
 	proxy *cas.Proxy, limiter *semaphore.Weighted, tracker *status.Tracker, opts CopyGraphOptions) error {
 	if proxy == nil {
@@ -242,11 +252,22 @@ func copyGraph(ctx context.Context, src content.ReadOnlyStorage, dst content.Sto
 			return nil
 		}
 		defer func() {
-			if err == nil {
-				// mark the content as done on success
+			// Mark the content as done only when it completed while the copy
+			// was still active. A success that lands after cancellation is a
+			// late result: it must not advance the tracker, or the parents of
+			// desc would keep copying, and eventually tag, a graph that the
+			// caller has already cancelled.
+			if err == nil && ctx.Err() == nil {
 				close(done)
 			}
 		}()
+
+		// Do not start new work once the copy has been cancelled: no new
+		// uploads are started for nodes that have not begun, and the
+		// concurrency slot held by this task is released back to the limiter.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		var successors []ocispec.Descriptor
 		findSuccessors := func() error {
@@ -324,6 +345,11 @@ func copyGraph(ctx context.Context, src content.ReadOnlyStorage, dst content.Sto
 		exists, err := proxy.Cache.Exists(ctx, desc)
 		if err != nil {
 			return fmt.Errorf("failed to check cache existence: %s: %w", desc.Digest, err)
+		}
+		// The copy may have been cancelled while the successors were being
+		// processed: do not start uploading new content after cancellation.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		pushNode := func() error {
 			if exists {

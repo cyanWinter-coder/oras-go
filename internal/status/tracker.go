@@ -47,3 +47,49 @@ func (t *Tracker) TryCommit(target ocispec.Descriptor) (chan struct{}, bool) {
 	status, exists := t.status.LoadOrStore(key, make(chan struct{}))
 	return status.(chan struct{}), !exists
 }
+
+// Status represents the completion state of the work tracked for a
+// descriptor.
+type Status int
+
+const (
+	// StatusPending means no work has been committed for the descriptor yet.
+	StatusPending Status = iota
+	// StatusCommitted means the work for the descriptor has been committed
+	// but has not completed. A descriptor whose work failed or was cancelled
+	// remains in this state: only actual completion advances the status.
+	StatusCommitted
+	// StatusDone means the work for the descriptor completed successfully.
+	StatusDone
+)
+
+// String returns a human-readable representation of the status.
+func (s Status) String() string {
+	switch s {
+	case StatusPending:
+		return "Pending"
+	case StatusCommitted:
+		return "Committed"
+	case StatusDone:
+		return "Done"
+	default:
+		return "Unknown"
+	}
+}
+
+// StatusOf returns the completion status of the work tracked for target.
+// It reflects the real per-node completion state: a node is StatusDone only
+// if its work finished successfully while the operation was still active.
+func (t *Tracker) StatusOf(target ocispec.Descriptor) Status {
+	key := descriptor.FromOCI(target)
+	status, exists := t.status.Load(key)
+	if !exists {
+		return StatusPending
+	}
+	select {
+	case <-status.(chan struct{}):
+		return StatusDone
+	default:
+		return StatusCommitted
+	}
+}

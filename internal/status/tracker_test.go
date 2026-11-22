@@ -70,6 +70,61 @@ func TestTracker_TryCommit(t *testing.T) {
 	}
 }
 
+func TestTracker_StatusOf(t *testing.T) {
+	tracker := NewTracker()
+	pending := ocispec.Descriptor{Size: 1}
+	inProgress := ocispec.Descriptor{Size: 2}
+	finished := ocispec.Descriptor{Size: 3}
+
+	if got := tracker.StatusOf(pending); got != StatusPending {
+		t.Fatalf("Tracker.StatusOf() = %v, want %v", got, StatusPending)
+	}
+
+	notify, committed := tracker.TryCommit(inProgress)
+	if !committed {
+		t.Fatalf("Tracker.TryCommit() got = %v, want %v", committed, true)
+	}
+	if got := tracker.StatusOf(inProgress); got != StatusCommitted {
+		t.Fatalf("Tracker.StatusOf() = %v, want %v", got, StatusCommitted)
+	}
+
+	done, committed := tracker.TryCommit(finished)
+	if !committed {
+		t.Fatalf("Tracker.TryCommit() got = %v, want %v", committed, true)
+	}
+	close(done)
+	if got := tracker.StatusOf(finished); got != StatusDone {
+		t.Fatalf("Tracker.StatusOf() = %v, want %v", got, StatusDone)
+	}
+
+	// a descriptor that was committed but never completed (e.g. its copy
+	// failed or was cancelled) must not report done
+	close(notify)
+	if got := tracker.StatusOf(inProgress); got != StatusDone {
+		t.Fatalf("Tracker.StatusOf() = %v, want %v", got, StatusDone)
+	}
+	if got := tracker.StatusOf(pending); got != StatusPending {
+		t.Fatalf("Tracker.StatusOf() = %v, want %v", got, StatusPending)
+	}
+}
+
+func TestStatus_String(t *testing.T) {
+	tests := []struct {
+		status Status
+		want   string
+	}{
+		{StatusPending, "Pending"},
+		{StatusCommitted, "Committed"},
+		{StatusDone, "Done"},
+		{Status(-1), "Unknown"},
+	}
+	for _, tt := range tests {
+		if got := tt.status.String(); got != tt.want {
+			t.Errorf("Status.String() = %v, want %v", got, tt.want)
+		}
+	}
+}
+
 // benchTrackerNodes is the number of distinct descriptors each TryCommit
 // benchmark iteration walks. Fixing it keeps the reported ns/op independent
 // of b.N and bounds the memory the benchmark holds.
