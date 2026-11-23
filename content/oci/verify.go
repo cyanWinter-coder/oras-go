@@ -41,6 +41,15 @@ import (
 // copy/verify default.
 const defaultVerifyConcurrency = 3
 
+// ErrLayoutChanged is returned by [Verify] when the layout was modified while
+// it was being verified: index.json or oci-layout at the end of the call
+// differs from what it was at the start, so the report spans more than one
+// generation of the layout and is authoritative for none of them. The report
+// is still returned, but a caller must not act on it -- in particular, must
+// not cache it as a successful verification or delete content listed as
+// unreferenced -- and should re-run Verify on a quiescent layout instead.
+var ErrLayoutChanged = errors.New("layout changed during verification")
+
 // VerifyOptions contains parameters for [Verify].
 type VerifyOptions struct {
 	// Concurrency limits the maximum number of concurrent blob verifications.
@@ -59,6 +68,11 @@ type VerifyReport struct {
 	Verified []VerifyEntry
 	// Failed lists blob paths whose content does not match the path digest, or
 	// that cannot be read.
+	//
+	// It also lists blobs whose size differs from the size declared by a
+	// descriptor that references them. Such a blob may hash to its path
+	// digest and appear in Verified as well, but every read of it through the
+	// referencing descriptor fails, so the reference is broken.
 	Failed []VerifyEntry
 	// Unverifiable lists paths that cannot be verified because the digest
 	// algorithm is unsupported, the file name is not a valid encoded digest,
@@ -71,6 +85,11 @@ type VerifyReport struct {
 	// index.json). The Reason says why. Such a blob may also be in Verified or
 	// Failed. Unreferenced is left empty then, because content that only that
 	// manifest references would look unreferenced.
+	//
+	// Finally, it lists manifests whose references form a cycle, which the
+	// OCI image specification forbids: the graph of an artifact is a DAG. A
+	// cycle does not stop reachability from being followed, so Unreferenced
+	// is still computed when one is found.
 	Unverifiable []VerifyEntry
 	// Layout lists problems with the structure of the layout outside of
 	// blobs/: a missing or invalid oci-layout or index.json, and the
@@ -130,6 +149,7 @@ type verifyAccumulator struct {
 	mu           sync.Mutex
 	verified     []VerifyEntry
 	failed       []VerifyEntry
+	failedPaths  map[string]struct{}
 	unverifiable []VerifyEntry
 	layout       []LayoutFinding
 	missing      []VerifyEntry
@@ -145,7 +165,19 @@ func (a *verifyAccumulator) addVerified(p string) {
 func (a *verifyAccumulator) addFailed(p string, reason error) {
 	a.mu.Lock()
 	a.failed = append(a.failed, VerifyEntry{Path: p, Reason: reason})
+	if a.failedPaths == nil {
+		a.failedPaths = make(map[string]struct{})
+	}
+	a.failedPaths[p] = struct{}{}
 	a.mu.Unlock()
+}
+
+// hasFailed reports whether p has already been recorded as failed.
+func (a *verifyAccumulator) hasFailed(p string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.failedPaths[p]
+	return ok
 }
 
 func (a *verifyAccumulator) addUnverifiable(p string, reason error) {
@@ -202,12 +234,21 @@ func (a *verifyAccumulator) report() *VerifyReport {
 // unreferenced. Unreferenced is authoritative only when nothing else is
 // writing to the layout; see [VerifyReport.Unreferenced].
 //
+// Verify binds its result to a single generation of the layout: it reads
+// index.json and oci-layout before and after the sweep, and if either was
+// added, removed or replaced in between, it returns [ErrLayoutChanged] along
+// with the report. The report then describes a layout that never existed at
+// any single moment, so it must not be treated as a successful (or
+// unsuccessful) verification of any generation; re-run Verify to get one.
+//
 // Verify is read-only: it does not create, modify, or remove any file in fsys.
 //
 // A blob that fails verification, or a problem with the layout files, does not
-// stop the sweep. The returned error is reserved for context cancellation and
-// for a layout root or blobs directory that cannot be read. On cancellation after the walk has started, the report describes
-// the entries processed before the sweep stopped.
+// stop the sweep. The returned error is reserved for context cancellation, for
+// a layout root or blobs directory that cannot be read, and for a layout that
+// changed while being verified. On cancellation after the walk has started,
+// the report describes the entries processed before the sweep stopped; a
+// partial result like that is never a successful verification.
 func Verify(ctx context.Context, fsys fs.FS, opts VerifyOptions) (*VerifyReport, error) {
 	if err := isContextDone(ctx); err != nil {
 		return nil, err
@@ -217,6 +258,7 @@ func Verify(ctx context.Context, fsys fs.FS, opts VerifyOptions) (*VerifyReport,
 		concurrency = defaultVerifyConcurrency
 	}
 
+	generation := readLayoutGeneration(fsys)
 	acc := &verifyAccumulator{}
 	index, err := verifyLayout(ctx, fsys, acc)
 	if err != nil {
@@ -296,6 +338,9 @@ func Verify(ctx context.Context, fsys fs.FS, opts VerifyOptions) (*VerifyReport,
 		if err := verifyReachability(ctx, fsys, index, present, unlisted, acc); err != nil {
 			return acc.report(), err
 		}
+	}
+	if generation.changed(readLayoutGeneration(fsys)) {
+		return acc.report(), fmt.Errorf("%w: the report spans more than one generation of the layout", ErrLayoutChanged)
 	}
 	return acc.report(), nil
 }

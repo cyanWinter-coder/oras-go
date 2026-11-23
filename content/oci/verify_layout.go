@@ -16,9 +16,11 @@ limitations under the License.
 package oci
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"time"
 
@@ -99,4 +101,55 @@ func leftoverFinding(p string, entry fs.DirEntry) LayoutFinding {
 		finding.ModTime = fi.ModTime()
 	}
 	return finding
+}
+
+// layoutGeneration identifies a generation of the metadata of a layout by the
+// content of its index.json and oci-layout files. [Verify] reads the
+// generation before and after its sweep, so that a layout that was modified
+// while being verified -- a manifest pushed, a tag moved, an index saved --
+// is reported as [ErrLayoutChanged] rather than as a result that silently
+// spans two generations.
+type layoutGeneration struct {
+	index  generationFile
+	layout generationFile
+}
+
+// generationFile is the content of one metadata file, or nothing when the
+// file cannot be read.
+type generationFile struct {
+	data []byte
+	ok   bool
+}
+
+// readLayoutGeneration reads the current generation of the layout in fsys.
+func readLayoutGeneration(fsys fs.FS) layoutGeneration {
+	return layoutGeneration{
+		index:  readGenerationFile(fsys, ocispec.ImageIndexFile),
+		layout: readGenerationFile(fsys, ocispec.ImageLayoutFile),
+	}
+}
+
+// changed reports whether other is a different generation than g.
+func (g layoutGeneration) changed(other layoutGeneration) bool {
+	return g.index.changed(other.index) || g.layout.changed(other.layout)
+}
+
+func (f generationFile) changed(other generationFile) bool {
+	return f.ok != other.ok || !bytes.Equal(f.data, other.data)
+}
+
+// readGenerationFile reads the whole of name. The file is always closed; a
+// file that cannot be read is indistinguishable from one that was never
+// there, which verifyLayout already reports on its own.
+func readGenerationFile(fsys fs.FS, name string) generationFile {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return generationFile{}
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return generationFile{}
+	}
+	return generationFile{data: data, ok: true}
 }

@@ -630,3 +630,212 @@ func TestVerify_Reachability_UnreadableNestedIndex(t *testing.T) {
 	wantPaths(t, "Unreferenced", report.Unreferenced)
 	mustContainPath(t, report.Verified, filePathOf(orphan))
 }
+
+func TestVerify_Reachability_SizeMismatch_Layer(t *testing.T) {
+	b := newLayoutBuilder(t)
+	config := b.blob(ocispec.MediaTypeImageConfig, []byte("config"))
+	layer := b.blob(ocispec.MediaTypeImageLayer, []byte("layer"))
+	declared := layer
+	declared.Size += 10
+	m := b.manifest(config, nil, declared)
+	b.tag(m, "v1")
+
+	report := b.verify()
+	got := mustContainPath(t, report.Failed, filePathOf(layer))
+	if !errors.Is(got.Reason, errMismatchedSize) {
+		t.Errorf("Failed reason = %v, want a size mismatch", got.Reason)
+	}
+	// the layer content itself is intact: only the descriptor lies
+	mustContainPath(t, report.Verified, filePathOf(layer))
+	wantPaths(t, "Missing", report.Missing)
+}
+
+func TestVerify_Reachability_SizeMismatch_IndexDescriptor(t *testing.T) {
+	b := newLayoutBuilder(t)
+	m, _, _ := b.image("a", nil)
+	declared := m
+	declared.Size--
+	b.tag(declared, "v1")
+
+	report := b.verify()
+	got := mustContainPath(t, report.Failed, filePathOf(m))
+	if !errors.Is(got.Reason, errMismatchedSize) {
+		t.Errorf("Failed reason = %v, want a size mismatch", got.Reason)
+	}
+}
+
+func TestVerify_Reachability_ManifestCycle(t *testing.T) {
+	b := newLayoutBuilder(t)
+	config := b.blob(ocispec.MediaTypeImageConfig, []byte("config"))
+
+	// Two manifests stored at paths their content does not hash to, each
+	// naming the other as its subject: a reference cycle, which content
+	// addressing cannot produce on its own.
+	dgstA := digest.NewDigestFromEncoded(digest.SHA256, strings.Repeat("a", 64))
+	dgstB := digest.NewDigestFromEncoded(digest.SHA256, strings.Repeat("b", 64))
+	manifestBytes := func(subject digest.Digest) []byte {
+		data, err := json.Marshal(ocispec.Manifest{
+			Versioned: specs.Versioned{SchemaVersion: 2},
+			MediaType: ocispec.MediaTypeImageManifest,
+			Config:    config,
+			Subject: &ocispec.Descriptor{
+				MediaType: ocispec.MediaTypeImageManifest,
+				Digest:    subject,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	dataA := manifestBytes(dgstB)
+	dataB := manifestBytes(dgstA)
+	pathA, _, _ := blobPathOf(dgstA)
+	pathB, _, _ := blobPathOf(dgstB)
+	b.files[pathA] = &fstest.MapFile{Data: dataA}
+	b.files[pathB] = &fstest.MapFile{Data: dataB}
+	b.untagged(ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    dgstA,
+		Size:      int64(len(dataA)),
+	})
+
+	report := b.verify()
+	// both manifests are corrupt: their content does not hash to their path
+	mustContainPath(t, report.Failed, pathA)
+	mustContainPath(t, report.Failed, pathB)
+	// the cycle they form is reported, once
+	var cycles []VerifyEntry
+	for _, e := range report.Unverifiable {
+		if errors.Is(e.Reason, errManifestCycle) {
+			cycles = append(cycles, e)
+		}
+	}
+	if len(cycles) != 1 {
+		t.Fatalf("cycle reported %d times, want 1", len(cycles))
+	}
+	if cycles[0].Path != pathA && cycles[0].Path != pathB {
+		t.Errorf("cycle reported at %q, want a manifest on the cycle", cycles[0].Path)
+	}
+}
+
+func TestVerify_Reachability_SharedBlobsNoCycle(t *testing.T) {
+	b := newLayoutBuilder(t)
+	config := b.blob(ocispec.MediaTypeImageConfig, []byte("config"))
+	layer1 := b.blob(ocispec.MediaTypeImageLayer, []byte("layer-1"))
+	layer2 := b.blob(ocispec.MediaTypeImageLayer, []byte("layer-2"))
+	// a diamond: two manifests sharing a config and a layer is not a cycle
+	m1 := b.manifest(config, nil, layer1)
+	m2 := b.manifest(config, nil, layer1, layer2)
+	b.tag(m1, "v1")
+	b.tag(m2, "v2")
+
+	report := b.verify()
+	wantPaths(t, "Unverifiable", report.Unverifiable)
+	wantPaths(t, "Failed", report.Failed)
+	wantPaths(t, "Missing", report.Missing)
+	wantPaths(t, "Unreferenced", report.Unreferenced)
+}
+
+// rewriteOnReadDirFS serves replacement content for name once dir has been
+// listed, simulating a metadata write that lands while Verify is walking the
+// layout.
+type rewriteOnReadDirFS struct {
+	fs.FS
+	dir         string
+	name        string
+	replacement []byte
+	rewritten   bool
+}
+
+func (f *rewriteOnReadDirFS) Open(name string) (fs.File, error) {
+	if name == f.name && f.rewritten {
+		return (fstest.MapFS{
+			name: &fstest.MapFile{Data: f.replacement},
+		}).Open(name)
+	}
+	return f.FS.Open(name)
+}
+
+func (f *rewriteOnReadDirFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name == f.dir {
+		f.rewritten = true
+	}
+	return fs.ReadDir(f.FS, name)
+}
+
+func TestVerify_LayoutChangedDuringVerification(t *testing.T) {
+	b := newLayoutBuilder(t)
+	m, _, _ := b.image("a", nil)
+	b.tag(m, "v1")
+	fsys := b.fsys()
+
+	indexData, err := fs.ReadFile(fsys, ocispec.ImageIndexFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := &rewriteOnReadDirFS{
+		FS:          fsys,
+		dir:         ocispec.ImageBlobsDir,
+		name:        ocispec.ImageIndexFile,
+		replacement: append(indexData, '\n'),
+	}
+
+	report, err := Verify(context.Background(), changed, VerifyOptions{})
+	if !errors.Is(err, ErrLayoutChanged) {
+		t.Fatalf("Verify() error = %v, want %v", err, ErrLayoutChanged)
+	}
+	if report == nil {
+		t.Fatal("Verify() report = nil, want the report of the abandoned run")
+	}
+
+	// once the write has settled, verification of the new generation succeeds
+	if _, err := Verify(context.Background(), changed, VerifyOptions{}); err != nil {
+		t.Fatalf("Verify() on the settled layout error = %v", err)
+	}
+}
+
+func TestVerify_Repeatable(t *testing.T) {
+	b := newLayoutBuilder(t)
+	m1, _, layer := b.image("a", nil)
+	b.tag(m1, "v1")
+	b.files[filePathOf(layer)] = &fstest.MapFile{Data: []byte("tampered")}
+	m2, _, gone := b.image("b", nil)
+	b.tag(m2, "v2")
+	b.remove(gone)
+	b.blob(ocispec.MediaTypeImageLayer, []byte("orphan"))
+	fsys := b.fsys()
+
+	first, err := Verify(context.Background(), fsys, VerifyOptions{})
+	if err != nil {
+		t.Fatal("first Verify() error =", err)
+	}
+	second, err := Verify(context.Background(), fsys, VerifyOptions{})
+	if err != nil {
+		t.Fatal("second Verify() error =", err)
+	}
+
+	sections := []struct {
+		name   string
+		first  []VerifyEntry
+		second []VerifyEntry
+	}{
+		{"Verified", first.Verified, second.Verified},
+		{"Failed", first.Failed, second.Failed},
+		{"Unverifiable", first.Unverifiable, second.Unverifiable},
+		{"Missing", first.Missing, second.Missing},
+		{"Unreferenced", first.Unreferenced, second.Unreferenced},
+	}
+	for _, s := range sections {
+		got, want := sortedPaths(s.first), sortedPaths(s.second)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s differs between runs: %v vs %v", s.name, got, want)
+		}
+	}
+	if got, want := layoutPaths(first.Layout), layoutPaths(second.Layout); !slices.Equal(got, want) {
+		t.Errorf("Layout differs between runs: %v vs %v", got, want)
+	}
+	// the corrupt layer and the missing reference are found in both runs
+	mustContainPath(t, second.Failed, filePathOf(layer))
+	mustContainPath(t, second.Missing, filePathOf(gone))
+}
