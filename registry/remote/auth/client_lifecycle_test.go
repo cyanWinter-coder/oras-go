@@ -23,8 +23,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/oras-project/oras-go/v3/registry/remote/credentials"
 	"github.com/oras-project/oras-go/v3/registry/remote/properties"
@@ -166,5 +168,120 @@ func TestClient_Do_RefreshesTokenAtMostOnce(t *testing.T) {
 	}
 	if got := tokenFetches.Load(); got != 1 {
 		t.Errorf("expected exactly 1 token refresh, got %d", got)
+	}
+}
+
+// TestClient_Do_ConcurrentRequestsShareTokenButAuthIndependently pins the
+// concurrency boundary: many requests against the same registry resource share
+// one token cache, so the token endpoint is hit once even when they start
+// together, while each request still runs its own challenge/authentication
+// sequence and independently succeeds.
+func TestClient_Do_ConcurrentRequestsShareTokenButAuthIndependently(t *testing.T) {
+	const accessToken = "concurrent/access/token"
+	const requestCount = 25
+
+	var tokenFetches atomic.Int32
+	var registrySuccesses atomic.Int32
+	var registryChallenges atomic.Int32
+
+	// The token endpoint blocks until every request has been challenged. Every
+	// fetch the cache does not coalesce would arrive here and block too, so the
+	// number of arrivals while blocked deterministically exposes whether the
+	// singleflight held, independent of goroutine scheduling.
+	releaseToken := make(chan struct{})
+	allChallenged := make(chan struct{})
+
+	as := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenFetches.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-releaseToken
+		fmt.Fprintf(w, `{"access_token":%q}`, accessToken)
+	}))
+	defer as.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+accessToken {
+			if registryChallenges.Add(1) == requestCount {
+				close(allChallenged)
+			}
+			w.Header().Set("Www-Authenticate",
+				fmt.Sprintf(`Bearer realm=%q,service=%q`, as.URL, r.Host))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		registrySuccesses.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+	client := newLifecycleClient(t, func(ctx context.Context, res properties.Resource) (credentials.Credential, error) {
+		if res.Host() != uri.Host {
+			t.Errorf("credential requested for unexpected host %q", res.Host())
+		}
+		return credentials.Credential{Username: "user", Password: "pass"}, nil
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, requestCount)
+	start := make(chan struct{})
+	for range requestCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL, nil)
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer retry.DrainAndClose(req.Context(), resp)
+			if resp.StatusCode != http.StatusOK {
+				errs <- fmt.Errorf("unexpected status %d", resp.StatusCode)
+			}
+		}()
+	}
+	close(start)
+
+	// Wait until every request has taken its own unauthenticated 401, by which
+	// point each has entered the token acquisition phase. The blocked token
+	// endpoint parks the first fetch, so the cache must coalesce the rest.
+	select {
+	case <-allChallenged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for all requests to be challenged")
+	}
+	// Give the stragglers time to reach cache.Set; a non-coalescing cache would
+	// show up as additional blocked arrivals at the token endpoint.
+	time.Sleep(100 * time.Millisecond)
+	if got := tokenFetches.Load(); got != 1 {
+		t.Errorf("expected the shared cache to coalesce to 1 token fetch, got %d", got)
+	}
+	close(releaseToken)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent request failed: %v", err)
+		}
+	}
+	if got := registrySuccesses.Load(); got != requestCount {
+		t.Errorf("expected %d independent successful requests, got %d", requestCount, got)
+	}
+	if got := tokenFetches.Load(); got != 1 {
+		t.Errorf("expected a single shared token fetch, got %d", got)
+	}
+	// every request still issued its own unauthenticated attempt first
+	if got := registryChallenges.Load(); got != requestCount {
+		t.Errorf("expected %d independent challenges, got %d", requestCount, got)
 	}
 }
