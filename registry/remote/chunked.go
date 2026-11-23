@@ -30,6 +30,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/oras-project/oras-go/v3/registry/remote/internal/errutil"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 )
 
 // headerOCIChunkMinLength is the response header a registry uses to advertise
@@ -145,7 +146,7 @@ func (s *blobStore) openUploadSession(ctx context.Context, chunkSize int64) (*ch
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 	if resp.StatusCode != http.StatusAccepted {
 		return nil, errutil.ParseErrorResponse(resp)
 	}
@@ -198,14 +199,14 @@ func (s *blobStore) uploadChunks(ctx context.Context, up *chunkedUpload, content
 		req.Header.Set("Content-Range", fmt.Sprintf("%d-%d", up.offset, up.offset+int64(n)-1))
 		req.ContentLength = int64(n)
 		resp, err := s.sendChunkRequest(up, req, func() (*http.Request, error) {
-			retry, rerr := http.NewRequestWithContext(ctx, http.MethodPatch, up.location.String(), bytes.NewReader(buf[:n]))
+			rebuiltReq, rerr := http.NewRequestWithContext(ctx, http.MethodPatch, up.location.String(), bytes.NewReader(buf[:n]))
 			if rerr != nil {
 				return nil, rerr
 			}
-			retry.Header.Set("Content-Type", "application/octet-stream")
-			retry.Header.Set("Content-Range", fmt.Sprintf("%d-%d", up.offset, up.offset+int64(n)-1))
-			retry.ContentLength = int64(n)
-			return retry, nil
+			rebuiltReq.Header.Set("Content-Type", "application/octet-stream")
+			rebuiltReq.Header.Set("Content-Range", fmt.Sprintf("%d-%d", up.offset, up.offset+int64(n)-1))
+			rebuiltReq.ContentLength = int64(n)
+			return rebuiltReq, nil
 		})
 		if err != nil {
 			s.cancelUpload(ctx, up.location)
@@ -213,13 +214,13 @@ func (s *blobStore) uploadChunks(ctx context.Context, up *chunkedUpload, content
 		}
 		if resp.StatusCode != http.StatusAccepted {
 			respErr := errutil.ParseErrorResponse(resp)
-			resp.Body.Close()
+			retry.DrainAndClose(ctx, resp)
 			s.cancelUpload(ctx, up.location)
 			return fmt.Errorf("chunked blob push: unexpected PATCH status %d after %d bytes: %w", resp.StatusCode, up.offset, respErr)
 		}
 		next, err := resolveUploadLocation(resp, req)
 		rangeHeader := resp.Header.Get("Range")
-		resp.Body.Close()
+		retry.DrainAndClose(ctx, resp)
 		if err != nil {
 			s.cancelUpload(ctx, up.location)
 			return fmt.Errorf("chunked blob push: invalid PATCH location after %d bytes: %w", up.offset, err)
@@ -261,14 +262,15 @@ func (s *blobStore) sendChunkRequest(up *chunkedUpload, req *http.Request, rebui
 	}
 	if resp.StatusCode == http.StatusUnauthorized && reuseAuth {
 		// The cached token was rejected; drop it and let the auth client
-		// re-authenticate on a fresh request.
-		resp.Body.Close()
+		// re-authenticate on a fresh request. Drain the challenged response so
+		// its connection can serve the rebuilt request.
+		retry.DrainAndClose(req.Context(), resp)
 		up.auth = ""
-		retry, rerr := rebuild()
+		rebuiltReq, rerr := rebuild()
 		if rerr != nil {
 			return nil, rerr
 		}
-		resp, err = s.repo.do(retry)
+		resp, err = s.repo.do(rebuiltReq)
 		if err != nil {
 			return nil, err
 		}
@@ -302,19 +304,19 @@ func (s *blobStore) closeUploadSession(ctx context.Context, up *chunkedUpload, f
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := s.sendChunkRequest(up, req, func() (*http.Request, error) {
-		retry, rerr := http.NewRequestWithContext(ctx, http.MethodPut, up.location.String(), http.NoBody)
+		rebuiltReq, rerr := http.NewRequestWithContext(ctx, http.MethodPut, up.location.String(), http.NoBody)
 		if rerr != nil {
 			return nil, rerr
 		}
-		retry.ContentLength = 0
-		retry.Header.Set("Content-Type", "application/octet-stream")
-		return retry, nil
+		rebuiltReq.ContentLength = 0
+		rebuiltReq.Header.Set("Content-Type", "application/octet-stream")
+		return rebuiltReq, nil
 	})
 	if err != nil {
 		s.cancelUpload(ctx, &sessionURL)
 		return fmt.Errorf("chunked blob push: PUT failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 	if resp.StatusCode != http.StatusCreated {
 		respErr := errutil.ParseErrorResponse(resp)
 		s.cancelUpload(ctx, &sessionURL)
@@ -341,7 +343,7 @@ func (s *blobStore) cancelUpload(ctx context.Context, location *url.URL) {
 	if err != nil {
 		return
 	}
-	resp.Body.Close()
+	retry.DrainAndClose(ctx, resp)
 }
 
 // parseChunkMinLength reads the registry-advertised OCI-Chunk-Min-Length header

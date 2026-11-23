@@ -30,6 +30,7 @@ import (
 	"github.com/oras-project/oras-go/v3/registry/remote/internal/errutil"
 	"github.com/oras-project/oras-go/v3/registry/remote/policy"
 	"github.com/oras-project/oras-go/v3/registry/remote/properties"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 )
 
 // Registry is an HTTP client to a remote registry.
@@ -182,7 +183,7 @@ func (r *Registry) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -242,7 +243,7 @@ func (r *Registry) repositories(ctx context.Context, last string, fn func(repos 
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", errutil.ParseErrorResponse(resp)

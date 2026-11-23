@@ -49,6 +49,7 @@ import (
 	"github.com/oras-project/oras-go/v3/registry/remote/internal/urlutil"
 	"github.com/oras-project/oras-go/v3/registry/remote/policy"
 	"github.com/oras-project/oras-go/v3/registry/remote/properties"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 )
 
 const (
@@ -790,7 +791,7 @@ func (r *Repository) tags(ctx context.Context, last string, fn func(tags []strin
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", errutil.ParseErrorResponse(resp)
@@ -919,7 +920,7 @@ func (r *Repository) referrersPageByAPI(ctx context.Context, artifactType string
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -1056,7 +1057,7 @@ func (r *Repository) pingReferrers(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -1099,7 +1100,7 @@ func (r *Repository) delete(ctx context.Context, target ocispec.Descriptor, isMa
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusAccepted:
@@ -1146,7 +1147,7 @@ func (s *blobStore) fetch(ctx context.Context, target ocispec.Descriptor) (rc io
 	}
 	defer func() {
 		if err != nil {
-			resp.Body.Close()
+			retry.DrainAndClose(ctx, resp)
 		}
 	}()
 
@@ -1202,15 +1203,15 @@ func (s *blobStore) Mount(ctx context.Context, desc ocispec.Descriptor, fromRepo
 		return err
 	}
 	if resp.StatusCode == http.StatusCreated {
-		defer resp.Body.Close()
+		defer retry.DrainAndClose(ctx, resp)
 		// Check the server seems to be behaving.
 		return verifyPushContentDigest(resp, desc.Digest, nil)
 	}
 	if resp.StatusCode != http.StatusAccepted {
-		defer resp.Body.Close()
+		defer retry.DrainAndClose(ctx, resp)
 		return errutil.ParseErrorResponse(resp)
 	}
-	resp.Body.Close()
+	retry.DrainAndClose(ctx, resp)
 	// From the [spec]:
 	//
 	// "If a registry does not support cross-repository mounting
@@ -1326,10 +1327,10 @@ func (s *blobStore) push(ctx context.Context, expected ocispec.Descriptor, conte
 	}
 
 	if resp.StatusCode != http.StatusAccepted {
-		defer resp.Body.Close()
+		defer retry.DrainAndClose(ctx, resp)
 		return errutil.ParseErrorResponse(resp)
 	}
-	resp.Body.Close()
+	retry.DrainAndClose(ctx, resp)
 	return s.completePushAfterInitialPost(ctx, req, resp, expected, content)
 }
 
@@ -1359,17 +1360,17 @@ func (s *blobStore) pushSingleRequest(ctx context.Context, expected ocispec.Desc
 	}
 	switch code := resp.StatusCode; {
 	case code == http.StatusCreated:
-		defer resp.Body.Close()
+		defer retry.DrainAndClose(ctx, resp)
 		return true, verifyPushContentDigest(resp, expected.Digest, nil)
 	case code == http.StatusAccepted:
 		// The registry ignored the digest and opened an upload session.
 		s.repo.singleRequestUnsupported.Store(true)
-		resp.Body.Close()
+		retry.DrainAndClose(ctx, resp)
 		return true, s.completePushAfterInitialPost(ctx, req, resp, expected, bytes.NewReader(buf))
 	case code == http.StatusUnauthorized, code == http.StatusForbidden, code == http.StatusTooManyRequests:
 		// a credential or rate-limit problem, not a missing feature
 	case code >= 400 && code < 500, code == http.StatusNotImplemented:
-		resp.Body.Close()
+		retry.DrainAndClose(ctx, resp)
 		// Only these say the feature is missing; others, such as 400
 		// DIGEST_INVALID or 404 NAME_UNKNOWN, are about this request.
 		switch code {
@@ -1378,7 +1379,7 @@ func (s *blobStore) pushSingleRequest(ctx context.Context, expected ocispec.Desc
 		}
 		return false, nil
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 	return true, errutil.ParseErrorResponse(resp)
 }
 
@@ -1487,7 +1488,7 @@ func (s *blobStore) completePushAfterInitialPost(ctx context.Context, req *http.
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	if resp.StatusCode != http.StatusCreated {
 		return errutil.ParseErrorResponse(resp)
@@ -1554,7 +1555,7 @@ func (s *blobStore) resolve(ctx context.Context, reference string) (ocispec.Desc
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -1594,7 +1595,7 @@ func (s *blobStore) FetchReference(ctx context.Context, reference string) (desc 
 	}
 	defer func() {
 		if err != nil {
-			resp.Body.Close()
+			retry.DrainAndClose(ctx, resp)
 		}
 	}()
 
@@ -1686,7 +1687,7 @@ func (s *manifestStore) fetch(ctx context.Context, target ocispec.Descriptor) (r
 	}
 	defer func() {
 		if err != nil {
-			resp.Body.Close()
+			retry.DrainAndClose(ctx, resp)
 		}
 	}()
 
@@ -1846,7 +1847,7 @@ func (s *manifestStore) resolve(ctx context.Context, reference string) (ocispec.
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -1900,7 +1901,7 @@ func (s *manifestStore) fetchReference(ctx context.Context, reference string) (d
 	}
 	defer func() {
 		if err != nil {
-			resp.Body.Close()
+			retry.DrainAndClose(ctx, resp)
 		}
 	}()
 
@@ -1979,7 +1980,7 @@ func (s *manifestStore) Untag(ctx context.Context, reference string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
@@ -2103,7 +2104,7 @@ func (s *manifestStore) push(ctx context.Context, expected ocispec.Descriptor, r
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer retry.DrainAndClose(ctx, resp)
 
 	if resp.StatusCode != http.StatusCreated {
 		return errutil.ParseErrorResponse(resp)
@@ -2449,6 +2450,9 @@ func (s *manifestStore) verifyPullContentDigest(resp *http.Response, expected di
 	if err != nil || canonical.Algorithm() == expected.Algorithm() {
 		return verifyPullDigestHeader(resp, expected)
 	}
+	// The body is read fully below and replaced with an in-memory copy; a plain
+	// close releases the (already drained) original. Draining here instead would
+	// consume the replacement before the caller gets to read it.
 	defer resp.Body.Close()
 	body, err := io.ReadAll(limitReader(resp.Body, s.repo.maxMetadataBytes()))
 	if err != nil {
@@ -2508,6 +2512,9 @@ func (v *verifyReadCloser) Read(p []byte) (int, error) {
 // calculateDigestFromResponse calculates the actual digest of the response body
 // taking care not to destroy it in the process.
 func calculateDigestFromResponse(resp *http.Response, maxMetadataBytes int64, algorithm digest.Algorithm) (digest.Digest, error) {
+	// The body is read fully below and replaced with an in-memory copy; a plain
+	// close releases the (already drained) original without consuming the
+	// replacement the caller will read.
 	defer resp.Body.Close()
 
 	body := limitReader(resp.Body, maxMetadataBytes)
