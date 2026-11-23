@@ -19,12 +19,10 @@ package cache
 import (
 	"context"
 	"io"
-	"sync"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/oras-project/oras-go/v3"
 	"github.com/oras-project/oras-go/v3/content"
-	"github.com/oras-project/oras-go/v3/internal/ioutil"
 	"github.com/oras-project/oras-go/v3/registry"
 )
 
@@ -37,6 +35,16 @@ type target struct {
 // CacheReadOnlyTarget creates a new cached target.
 // The returned target will first check the cache for content before
 // fetching from the source. Fetched content is cached while being read.
+//
+// The cache only ever holds complete, verified content. On a cache miss, the
+// content read from the source is staged under a temporary identity that
+// ordinary reads cannot observe. The staged copy becomes the cache entry of
+// its digest only after the whole content has been read and verified against
+// the descriptor. Cancellation, a read error, a digest mismatch, a size
+// mismatch, or closing the reader before the content is complete discards the
+// staging, closes the source reader, and leaves the cache untouched. A
+// completed commit is idempotent: content that is already cached is not
+// rewritten, so concurrent readers of the same content can all commit safely.
 //
 // The returned target keeps the following optional interfaces of the source,
 // so that type assertions for them succeed exactly when they succeed on the
@@ -89,6 +97,15 @@ func CacheReadOnlyTarget(source oras.ReadOnlyTarget, cache content.Storage) oras
 // Fetch fetches the content identified by the descriptor.
 // It first checks the cache, and if not found, fetches from the source
 // while caching the content.
+//
+// The content is committed to the cache only when the whole content has been
+// read and verified against desc and the reader is closed. Until then the
+// cached copy is not visible: a concurrent Fetch either hits a previously
+// committed copy or fetches from the source again. If the content does not
+// match desc, or the reader is closed before the content is complete, nothing
+// is cached. A read error is returned by the Read that encountered it, and a
+// verification failure, or a Close before the content is complete, is returned
+// by Close. In both cases the source reader is closed.
 func (t *target) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	rc, err := t.cache.Fetch(ctx, desc)
 	if err == nil {
@@ -100,42 +117,7 @@ func (t *target) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadClo
 		return nil, err
 	}
 
-	return t.cacheReadCloser(ctx, rc, desc), nil
-}
-
-// cacheReadCloser wraps the reader to cache content while reading.
-func (t *target) cacheReadCloser(ctx context.Context, rc io.ReadCloser, desc ocispec.Descriptor) io.ReadCloser {
-	pr, pw := io.Pipe()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var pushErr error
-	go func() {
-		defer wg.Done()
-		pushErr = t.cache.Push(ctx, desc, pr)
-		if pushErr != nil {
-			pr.CloseWithError(pushErr)
-		}
-	}()
-
-	closer := ioutil.CloserFunc(func() error {
-		rcErr := rc.Close()
-		if err := pw.Close(); err != nil {
-			return err
-		}
-		wg.Wait()
-		if pushErr != nil {
-			return pushErr
-		}
-		return rcErr
-	})
-
-	return struct {
-		io.Reader
-		io.Closer
-	}{
-		Reader: io.TeeReader(rc, pw),
-		Closer: closer,
-	}
+	return newCacheReader(ctx, rc, desc, t.cache), nil
 }
 
 // Exists returns true if the described content exists.
@@ -157,7 +139,8 @@ type referenceTarget struct {
 // FetchReference fetches the content identified by the reference.
 // It first resolves the reference to a descriptor via a lightweight HEAD
 // request, then serves from the local cache if available. On a cache miss,
-// the content is fetched from the source and cached while being read.
+// the content is fetched from the source and cached while being read, on the
+// same terms as [target.Fetch].
 //
 // Trade-off: a cache miss requires one extra HEAD request (Resolve) compared
 // to a direct FetchReference call. Cache hits avoid downloading any content
@@ -181,7 +164,7 @@ func (t *referenceTarget) FetchReference(ctx context.Context, reference string) 
 	if err != nil {
 		return ocispec.Descriptor{}, nil, err
 	}
-	return fetchedDesc, t.cacheReadCloser(ctx, rc, fetchedDesc), nil
+	return fetchedDesc, newCacheReader(ctx, rc, fetchedDesc, t.cache), nil
 }
 
 // The types below add the optional interfaces that CacheReadOnlyTarget passes

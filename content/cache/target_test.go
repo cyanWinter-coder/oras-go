@@ -492,7 +492,7 @@ func (e *errorStorage) Push(_ context.Context, _ ocispec.Descriptor, r io.Reader
 	if e.pushErr != nil {
 		return e.pushErr
 	}
-	// Drain the reader so the cacheReadCloser pipe does not block.
+	// Drain the reader so a staged content is fully consumed.
 	_, _ = io.Copy(io.Discard, r)
 	return nil
 }
@@ -616,15 +616,20 @@ func TestTarget_Fetch_CachePushError(t *testing.T) {
 		t.Fatal("Fetch() error =", err)
 	}
 
-	// Read all content - the push error causes pr.CloseWithError which
-	// propagates the error through the pipe to the TeeReader
-	_, err = io.ReadAll(rc)
-	if err == nil {
-		t.Error("Fetch().Read() expected error from failed push, got nil")
+	// Reading the content succeeds: caching no longer interleaves a write
+	// with the caller's read.
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal("Fetch().Read() error =", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("Fetch() = %v, want %v", got, content)
 	}
 
-	// Close should also fail due to the push error
-	_ = rc.Close()
+	// The cache error is reported by Close, when the staging is committed.
+	if err := rc.Close(); err == nil {
+		t.Error("Fetch().Close() expected error from failed push, got nil")
+	}
 }
 
 func TestTarget_Fetch_ReaderCloseError(t *testing.T) {
@@ -691,6 +696,198 @@ func (m *mockSourceWithCloseError) Resolve(_ context.Context, _ string) (ocispec
 
 func (m *mockSourceWithCloseError) Exists(_ context.Context, _ ocispec.Descriptor) (bool, error) {
 	return true, nil
+}
+
+// countedSource is a source whose reader records whether it was closed, so
+// that a failed cache commit or a cancellation can be shown to release the
+// underlying stream.
+type countedSource struct {
+	content []byte
+	reader  *countingReadCloser
+}
+
+func (s *countedSource) Fetch(_ context.Context, _ ocispec.Descriptor) (io.ReadCloser, error) {
+	s.reader = &countingReadCloser{Reader: bytes.NewReader(s.content)}
+	return s.reader, nil
+}
+
+func (s *countedSource) Resolve(_ context.Context, _ string) (ocispec.Descriptor, error) {
+	return ocispec.Descriptor{}, errors.New("not implemented")
+}
+
+func (s *countedSource) Exists(_ context.Context, _ ocispec.Descriptor) (bool, error) {
+	return true, nil
+}
+
+type countingReadCloser struct {
+	io.Reader
+	closed int
+}
+
+func (r *countingReadCloser) Close() error {
+	r.closed++
+	return nil
+}
+
+func TestTarget_Fetch_Truncated(t *testing.T) {
+	content := []byte("hello world")
+	// The source provides less content than the descriptor declares.
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(content),
+		Size:      int64(len(content)) + 1,
+	}
+	src := &countedSource{content: content}
+	cache := memory.New()
+	ctx := context.Background()
+
+	cachedTarget := CacheReadOnlyTarget(src, cache)
+	rc, err := cachedTarget.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if _, err := io.ReadAll(rc); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ReadAll() error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	if err := rc.Close(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("Close() error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	if exists, err := cache.Exists(ctx, desc); err != nil || exists {
+		t.Errorf("cache.Exists() = %v, %v, want false, nil", exists, err)
+	}
+	if src.reader.closed == 0 {
+		t.Error("source reader was not closed")
+	}
+}
+
+func TestTarget_Fetch_DigestMismatch(t *testing.T) {
+	actual := []byte("hello world")
+	declared := []byte("HELLO WORLD") // same size, different digest
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(declared),
+		Size:      int64(len(declared)),
+	}
+	src := &countedSource{content: actual}
+	cache := memory.New()
+	ctx := context.Background()
+
+	cachedTarget := CacheReadOnlyTarget(src, cache)
+	rc, err := cachedTarget.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if _, err := io.ReadAll(rc); !errors.Is(err, content.ErrMismatchedDigest) {
+		t.Fatalf("ReadAll() error = %v, want %v", err, content.ErrMismatchedDigest)
+	}
+	if err := rc.Close(); !errors.Is(err, content.ErrMismatchedDigest) {
+		t.Errorf("Close() error = %v, want %v", err, content.ErrMismatchedDigest)
+	}
+	if exists, err := cache.Exists(ctx, desc); err != nil || exists {
+		t.Errorf("cache.Exists() = %v, %v, want false, nil", exists, err)
+	}
+	if src.reader.closed == 0 {
+		t.Error("source reader was not closed")
+	}
+}
+
+func TestTarget_Fetch_Canceled(t *testing.T) {
+	content := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(content),
+		Size:      int64(len(content)),
+	}
+	src := &countedSource{content: content}
+	cache := memory.New()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cachedTarget := CacheReadOnlyTarget(src, cache)
+	rc, err := cachedTarget.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if _, err := io.ReadFull(rc, make([]byte, 4)); err != nil {
+		t.Fatalf("ReadFull() error = %v", err)
+	}
+	cancel()
+
+	if _, err := io.ReadAll(rc); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll() error = %v, want %v", err, context.Canceled)
+	}
+	if err := rc.Close(); !errors.Is(err, context.Canceled) {
+		t.Errorf("Close() error = %v, want %v", err, context.Canceled)
+	}
+	if exists, err := cache.Exists(context.Background(), desc); err != nil || exists {
+		t.Errorf("cache.Exists() = %v, %v, want false, nil", exists, err)
+	}
+	if src.reader.closed == 0 {
+		t.Error("source reader was not closed")
+	}
+}
+
+func TestTarget_Fetch_StagedNotVisible(t *testing.T) {
+	content := []byte("hello world")
+	desc := ocispec.Descriptor{
+		MediaType: "test",
+		Digest:    digest.FromBytes(content),
+		Size:      int64(len(content)),
+	}
+	src := &countedSource{content: content}
+	cache := memory.New()
+	ctx := context.Background()
+
+	cachedTarget := CacheReadOnlyTarget(src, cache)
+
+	// A reader that is opened but not closed has not committed anything.
+	rc, err := cachedTarget.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if exists, err := cache.Exists(ctx, desc); err != nil || exists {
+		t.Errorf("cache.Exists() before Close = %v, %v, want false, nil", exists, err)
+	}
+
+	// A second Fetch while the first is still open misses the cache and goes
+	// to the source again.
+	rc2, err := cachedTarget.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("second Fetch() error = %v", err)
+	}
+	if got, err := io.ReadAll(rc2); err != nil || !bytes.Equal(got, content) {
+		t.Errorf("second Fetch() = %q, %v, want %q, nil", got, err, content)
+	}
+	if err := rc2.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+
+	// The second commit makes the content visible; the first is then
+	// idempotent.
+	if err := rc.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if exists, err := cache.Exists(ctx, desc); err != nil || !exists {
+		t.Errorf("cache.Exists() after Close = %v, %v, want true, nil", exists, err)
+	}
+
+	// A following Fetch is served from the cache, not the source.
+	before := src.reader
+	rc3, err := cachedTarget.Fetch(ctx, desc)
+	if err != nil {
+		t.Fatalf("third Fetch() error = %v", err)
+	}
+	if got, err := io.ReadAll(rc3); err != nil || !bytes.Equal(got, content) {
+		t.Errorf("third Fetch() = %q, %v, want %q, nil", got, err, content)
+	}
+	if err := rc3.Close(); err != nil {
+		t.Fatalf("third Close() error = %v", err)
+	}
+	if src.reader != before {
+		t.Error("third Fetch() went to the source despite a cache hit")
+	}
 }
 
 func TestReferenceTarget_FetchReference_CacheFetchFailsFallsBack(t *testing.T) {
