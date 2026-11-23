@@ -60,8 +60,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp, respErr := t.roundTrip(req)
 		duration, err := policy.Retry(attempt, resp, respErr)
 		if err != nil {
+			// The policy rejected this response (or the round trip failed):
+			// no further attempt will use it. Drain before closing so the
+			// connection can be returned to the idle pool rather than torn
+			// down with an unread body.
 			if respErr == nil {
-				resp.Body.Close()
+				DrainAndClose(req.Context(), resp)
 			}
 			return nil, err
 		}
@@ -72,20 +76,23 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// rewind the body if possible
 		if req.Body != nil {
 			if req.GetBody == nil {
-				// body can't be rewound, so we can't retry
+				// body can't be rewound, so we can't retry. The response is
+				// handed to the caller, which owns the body.
 				return resp, respErr
 			}
 			body, err := req.GetBody()
 			if err != nil {
-				// failed to rewind the body, so we can't retry
+				// failed to rewind the body, so we can't retry. The response
+				// is handed to the caller, which owns the body.
 				return resp, respErr
 			}
 			req.Body = body
 		}
 
-		// close the response body if needed
+		// drain then close the abandoned response so its connection is reused
+		// for the next attempt instead of being closed with an unread body
 		if respErr == nil {
-			resp.Body.Close()
+			DrainAndClose(req.Context(), resp)
 		}
 
 		timer := time.NewTimer(duration)
