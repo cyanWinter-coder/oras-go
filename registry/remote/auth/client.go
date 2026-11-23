@@ -593,7 +593,9 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 	if cachedBearer && isInvalidTokenResponse(resp) {
 		req = originalReq.Clone(ctx)
 		if err := rewindRequestBody(req); err == nil {
-			resp.Body.Close()
+			// discard the 400 response before reissuing; draining first keeps
+			// its connection reusable
+			retry.DrainAndClose(ctx, resp)
 			resp, err = c.send(req)
 			if err != nil {
 				return nil, err
@@ -633,7 +635,8 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 	scheme, params := parseChallenge(challenge)
 	switch scheme {
 	case SchemeBasic:
-		resp.Body.Close()
+		// the 401 response is consumed by the authenticated retry below
+		retry.DrainAndClose(ctx, resp)
 
 		token, err := cache.Set(ctx, cacheKey, SchemeBasic, "", func(ctx context.Context) (string, error) {
 			return c.fetchBasicAuth(ctx, resource)
@@ -645,7 +648,8 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 		req = authReq.Clone(ctx)
 		req.Header.Set(headerAuthorization, "Basic "+token)
 	case SchemeBearer:
-		resp.Body.Close()
+		// the 401 response is consumed by the authenticated retry below
+		retry.DrainAndClose(ctx, resp)
 
 		scopes := GetScopesForResource(ctx, resource)
 		if paramScope := params["scope"]; paramScope != "" {
@@ -674,7 +678,9 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 				if resp.StatusCode != http.StatusUnauthorized && !isInvalidTokenResponse(resp) {
 					return resp, nil
 				}
-				resp.Body.Close()
+				// still challenged: discard this attempt and fall through to
+				// fetching a token with the challenged scopes
+				retry.DrainAndClose(ctx, resp)
 			}
 		}
 

@@ -31,6 +31,7 @@ import (
 	"github.com/oras-project/oras-go/v3/registry/remote/errcode"
 	"github.com/oras-project/oras-go/v3/registry/remote/internal/errutil"
 	"github.com/oras-project/oras-go/v3/registry/remote/properties"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 )
 
 // TokenParams contains parameters for token acquisition.
@@ -187,7 +188,10 @@ func (f *DistributionTokenFetcher) FetchToken(ctx context.Context, params TokenP
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	// drain then close: the token bodies are small, and draining lets the
+	// connection return to the pool even when the response is an error whose
+	// body was only partially parsed
+	defer retry.DrainAndClose(req.Context(), resp)
 	if resp.StatusCode != http.StatusOK {
 		return "", errutil.ParseErrorResponse(resp)
 	}
@@ -243,7 +247,10 @@ func (f *OAuth2TokenFetcher) FetchToken(ctx context.Context, params TokenParams,
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	// drain then close: the token bodies are small, and draining lets the
+	// connection return to the pool even when the response is an error whose
+	// body was only partially parsed
+	defer retry.DrainAndClose(req.Context(), resp)
 	if resp.StatusCode != http.StatusOK {
 		return "", errutil.ParseErrorResponse(resp)
 	}

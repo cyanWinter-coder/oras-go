@@ -1,0 +1,170 @@
+/*
+Copyright The ORAS Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package auth
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
+	"testing"
+
+	"github.com/oras-project/oras-go/v3/registry/remote/credentials"
+	"github.com/oras-project/oras-go/v3/registry/remote/properties"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
+)
+
+// newLifecycleClient builds an auth.Client whose requests share one pooled
+// transport, so a test can observe whether a connection is reused across the
+// unauthenticated 401 attempt and the authenticated retry.
+func newLifecycleClient(t *testing.T, credential credentials.CredentialFunc) *Client {
+	t.Helper()
+	return &Client{
+		Client: &http.Client{
+			Transport: retry.NewTransport(http.DefaultTransport.(*http.Transport).Clone()),
+		},
+		CredentialFunc: credential,
+		Cache:          NewCache(),
+	}
+}
+
+// TestClient_Do_Drains401BodyAndReusesConnection proves the response lifecycle
+// boundary on a bearer challenge: the 401 response carries a sizable body that
+// the client never returns to its caller, yet it must be drained before the
+// authenticated retry so the TCP connection is reused rather than closed with
+// an unread body.
+func TestClient_Do_Drains401BodyAndReusesConnection(t *testing.T) {
+	const accessToken = "lifecycle/access/token"
+	const bodySize = 8 * 1024
+
+	var registryConns []string
+	var registryHits atomic.Int32
+
+	as := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// fully consume the token request body so its connection is reusable too
+		_, _ = io.Copy(io.Discard, r.Body)
+		fmt.Fprintf(w, `{"access_token":%q}`, accessToken)
+	}))
+	defer as.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registryConns = append(registryConns, r.RemoteAddr)
+		if r.Header.Get("Authorization") != "Bearer "+accessToken {
+			w.Header().Set("Www-Authenticate",
+				fmt.Sprintf(`Bearer realm=%q,service=%q`, as.URL, r.Host))
+			w.WriteHeader(http.StatusUnauthorized)
+			// a body larger than a single read, left entirely to the client
+			// to drain
+			_, _ = w.Write(bytes.Repeat([]byte("z"), bodySize))
+			return
+		}
+		registryHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+	client := newLifecycleClient(t, func(ctx context.Context, res properties.Resource) (credentials.Credential, error) {
+		if res.Host() != uri.Host {
+			t.Errorf("credential requested for unexpected host %q", res.Host())
+		}
+		return credentials.Credential{Username: "user", Password: "pass"}, nil
+	})
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Client.Do() error = %v", err)
+	}
+	retry.DrainAndClose(req.Context(), resp)
+
+	if got := registryHits.Load(); got != 1 {
+		t.Fatalf("expected 1 authenticated success, got %d", got)
+	}
+	// two registry hits: the unauthenticated attempt and the authenticated retry
+	if len(registryConns) != 2 {
+		t.Fatalf("expected 2 registry requests, got %d", len(registryConns))
+	}
+	if registryConns[0] != registryConns[1] {
+		t.Errorf("expected the authenticated retry to reuse the 401 connection %q, got %q",
+			registryConns[0], registryConns[1])
+	}
+}
+
+// TestClient_Do_RefreshesTokenAtMostOnce pins the authorization boundary: a
+// token that the registry keeps rejecting results in exactly one refresh
+// attempt, after which the second 401 is returned to the caller rather than
+// triggering an unbounded re-authentication loop.
+func TestClient_Do_RefreshesTokenAtMostOnce(t *testing.T) {
+	var challengeHits atomic.Int32
+	var tokenFetches atomic.Int32
+
+	as := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenFetches.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		// every fetched token is immediately stale
+		fmt.Fprintf(w, `{"access_token":%q}`, "stale")
+	}))
+	defer as.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		challengeHits.Add(1)
+		w.Header().Set("Www-Authenticate",
+			fmt.Sprintf(`Bearer realm=%q,service=%q`, as.URL, r.Host))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"errors":[{"code":"UNAUTHORIZED"}]}`))
+	}))
+	defer ts.Close()
+
+	client := newLifecycleClient(t, func(ctx context.Context, res properties.Resource) (credentials.Credential, error) {
+		return credentials.Credential{Username: "user", Password: "pass"}, nil
+	})
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Client.Do() error = %v", err)
+	}
+	retry.DrainAndClose(req.Context(), resp)
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected the second 401 to be returned, got status %d", resp.StatusCode)
+	}
+	// one unauthenticated attempt + one authenticated retry; no third attempt
+	if got := challengeHits.Load(); got != 2 {
+		t.Errorf("expected exactly 2 registry requests, got %d", got)
+	}
+	if got := tokenFetches.Load(); got != 1 {
+		t.Errorf("expected exactly 1 token refresh, got %d", got)
+	}
+}
