@@ -264,6 +264,11 @@ type Repository struct {
 	// referrers index tagged by referrers tag schema.
 	referrersMergePool syncutil.Pool[syncutil.Merge[referrerChange]]
 
+	// referrersPreconditionUnsupported records that the registry rejected a
+	// conditional referrers index push, so later updates skip the precondition.
+	// See updateReferrersIndex.
+	referrersPreconditionUnsupported atomic.Bool
+
 	// singleRequestUnsupported records that the registry ignored or rejected a
 	// single-request blob push, so later pushes skip it. See
 	// SingleRequestPushThreshold.
@@ -976,7 +981,7 @@ func (r *Repository) referrersByTagSchema(ctx context.Context, desc ocispec.Desc
 	if err != nil {
 		return err
 	}
-	_, referrers, err := r.referrersFromIndex(ctx, referrersTag, desc)
+	_, referrers, _, err := r.referrersFromIndex(ctx, referrersTag, desc)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			// no referrers to the manifest
@@ -993,32 +998,32 @@ func (r *Repository) referrersByTagSchema(ctx context.Context, desc ocispec.Desc
 }
 
 // referrersFromIndex queries the referrers index using the the given referrers
-// tag. If Succeeded, returns the descriptor of referrers index and the
-// referrers list.
-func (r *Repository) referrersFromIndex(ctx context.Context, referrersTag string, subject ocispec.Descriptor) (ocispec.Descriptor, []ocispec.Descriptor, error) {
+// tag. If Succeeded, returns the descriptor of referrers index, the referrers
+// list, and the entity tag the registry supplied for the index, if any.
+func (r *Repository) referrersFromIndex(ctx context.Context, referrersTag string, subject ocispec.Descriptor) (ocispec.Descriptor, []ocispec.Descriptor, string, error) {
 	// The referrers index is maintained by clients and never signed, so it is
 	// not subject to the policy.
-	desc, rc, err := r.manifests().fetchReference(ctx, referrersTag)
+	desc, rc, validator, err := r.manifests().fetchReferenceValidator(ctx, referrersTag)
 	if err != nil {
-		return ocispec.Descriptor{}, nil, err
+		return ocispec.Descriptor{}, nil, "", err
 	}
 	defer rc.Close()
 
 	// Some registries resolve the fallback tag to the subject itself. Its
 	// children are not referrers, and the tag schema requires an OCI index.
 	if desc.MediaType != ocispec.MediaTypeImageIndex || desc.Digest == subject.Digest {
-		return ocispec.Descriptor{}, nil, fmt.Errorf("invalid referrers index from referrers tag %s: %w", referrersTag, errdef.ErrNotFound)
+		return ocispec.Descriptor{}, nil, "", fmt.Errorf("invalid referrers index from referrers tag %s: %w", referrersTag, errdef.ErrNotFound)
 	}
 
 	if err := limitSize(desc, r.maxMetadataBytes()); err != nil {
-		return ocispec.Descriptor{}, nil, fmt.Errorf("failed to read referrers index from referrers tag %s: %w", referrersTag, err)
+		return ocispec.Descriptor{}, nil, "", fmt.Errorf("failed to read referrers index from referrers tag %s: %w", referrersTag, err)
 	}
 	var index ocispec.Index
 	if err := decodeJSON(rc, desc, &index); err != nil {
-		return ocispec.Descriptor{}, nil, fmt.Errorf("failed to decode referrers index from referrers tag %s: %w", referrersTag, err)
+		return ocispec.Descriptor{}, nil, "", fmt.Errorf("failed to decode referrers index from referrers tag %s: %w", referrersTag, err)
 	}
 
-	return desc, index.Manifests, nil
+	return desc, index.Manifests, validator, nil
 }
 
 // pingReferrers returns true if the Referrers API is available for r.
@@ -1878,25 +1883,34 @@ func (s *manifestStore) FetchReference(ctx context.Context, reference string) (o
 // fetchReference is FetchReference without the policy check, for callers
 // that have already checked the operation it is part of.
 func (s *manifestStore) fetchReference(ctx context.Context, reference string) (desc ocispec.Descriptor, rc io.ReadCloser, err error) {
+	desc, rc, _, err = s.fetchReferenceValidator(ctx, reference)
+	return
+}
+
+// fetchReferenceValidator is [manifestStore.fetchReference] that also returns
+// the entity tag of the fetched manifest, if the registry supplied one. The
+// entity tag is the validator a conditional write on the same reference must
+// carry: it is opaque and need not equal the descriptor digest.
+func (s *manifestStore) fetchReferenceValidator(ctx context.Context, reference string) (desc ocispec.Descriptor, rc io.ReadCloser, validator string, err error) {
 	ref, err := s.repo.ParseReference(reference)
 	if err != nil {
-		return ocispec.Descriptor{}, nil, err
+		return ocispec.Descriptor{}, nil, "", err
 	}
 	if err := checkReferenceDigestAlgorithm(ref); err != nil {
-		return ocispec.Descriptor{}, nil, err
+		return ocispec.Descriptor{}, nil, "", err
 	}
 
 	ctx = auth.AppendRepositoryScope(ctx, ref, auth.ActionPull)
 	url := buildRepositoryManifestURL(s.repo.plainHTTP(), ref)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return ocispec.Descriptor{}, nil, err
+		return ocispec.Descriptor{}, nil, "", err
 	}
 	req.Header.Set("Accept", manifestAcceptHeader(s.repo.manifestMediaTypes()))
 
 	resp, err := s.repo.do(req)
 	if err != nil {
-		return ocispec.Descriptor{}, nil, err
+		return ocispec.Descriptor{}, nil, "", err
 	}
 	defer func() {
 		if err != nil {
@@ -1920,13 +1934,13 @@ func (s *manifestStore) fetchReference(ctx context.Context, reference string) (d
 			desc, err = s.generateDescriptor(resp, ref, req.Method)
 		}
 		if err != nil {
-			return ocispec.Descriptor{}, nil, err
+			return ocispec.Descriptor{}, nil, "", err
 		}
-		return desc, resp.Body, nil
+		return desc, resp.Body, resp.Header.Get("ETag"), nil
 	case http.StatusNotFound:
-		return ocispec.Descriptor{}, nil, fmt.Errorf("%s: %w", ref, errdef.ErrNotFound)
+		return ocispec.Descriptor{}, nil, "", fmt.Errorf("%s: %w", ref, errdef.ErrNotFound)
 	default:
-		return ocispec.Descriptor{}, nil, errutil.ParseErrorResponse(resp)
+		return ocispec.Descriptor{}, nil, "", errutil.ParseErrorResponse(resp)
 	}
 }
 
@@ -2022,11 +2036,19 @@ type verifiedManifest struct {
 	body []byte
 }
 
-// push pushes the manifest content, matching the expected descriptor.
+// push pushes the manifest content, matching the expected descriptor, without
+// any conditional header.
 // A tag-addressed push buffers the bytes (capped by MaxMetadataBytes) so a
 // registry-chosen Docker-Content-Digest algorithm can be checked against those
 // bytes; a digest-addressed push stays strict — see [verifyPushContentDigest].
 func (s *manifestStore) push(ctx context.Context, expected ocispec.Descriptor, r io.Reader, reference string) error {
+	return s.pushConditional(ctx, expected, r, reference, referrersIndexPrecondition{})
+}
+
+// pushConditional is [manifestStore.push] with an optional HTTP precondition
+// attached to the request. A registry that enforces the precondition rejects a
+// stale write with 412; the rejection is returned as an *errcode.ErrorResponse.
+func (s *manifestStore) pushConditional(ctx context.Context, expected ocispec.Descriptor, r io.Reader, reference string, precond referrersIndexPrecondition) error {
 	repoRef := s.repo.reference()
 	ref := repoRef
 	var pushed []byte
@@ -2072,6 +2094,12 @@ func (s *manifestStore) push(ctx context.Context, expected ocispec.Descriptor, r
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
 	if err != nil {
 		return err
+	}
+	if precond.ifMatch != "" {
+		req.Header.Set("If-Match", precond.ifMatch)
+	}
+	if precond.ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", precond.ifNoneMatch)
 	}
 	if req.GetBody != nil && req.ContentLength != expected.Size {
 		// short circuit a size mismatch for built-in types.
@@ -2227,6 +2255,14 @@ func (s *manifestStore) indexReferrersForPush(ctx context.Context, desc ocispec.
 
 // updateReferrersIndex updates the referrers index for desc referencing subject
 // on manifest push and manifest delete.
+//
+// The update is a read-modify-write of the tag-schema index. Concurrent writers
+// cannot be serialized by the registry, so the update runs as a transaction:
+// read the index and its baseline, merge only this caller's change, publish
+// conditionally on that baseline, and, when the registry reports that the index
+// moved on, re-read and retry. Concurrent changes from clients in this process
+// are additionally batched by referrersMergePool; each retry reapplies the whole
+// batch, so no client's change is dropped.
 // References:
 //   - https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-manifests-with-subject
 //   - https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#deleting-manifests
@@ -2235,61 +2271,42 @@ func (s *manifestStore) updateReferrersIndex(ctx context.Context, subject ocispe
 	if err != nil {
 		return err
 	}
+	t := &referrersIndexTransaction{
+		tag:     referrersTag,
+		subject: subject,
+		skipGC:  s.repo.skipReferrersGC(),
+	}
 
-	var oldIndexDesc *ocispec.Descriptor
-	var oldReferrers []ocispec.Descriptor
 	prepare := func() error {
-		// 1. pull the original referrers list using the referrers tag schema
-		indexDesc, referrers, err := s.repo.referrersFromIndex(ctx, referrersTag, subject)
-		if err != nil {
-			if errors.Is(err, errdef.ErrNotFound) {
-				// valid case: no old referrers index
-				return nil
-			}
-			return err
-		}
-		oldIndexDesc = &indexDesc
-		oldReferrers = referrers
-		return nil
+		// Read the baseline the batch is applied to.
+		return s.repo.referrersIndexRead(ctx, t)
 	}
 	update := func(referrerChanges []referrerChange) error {
-		// 2. apply the referrer changes on the referrers list
-		updatedReferrers, err := applyReferrerChanges(oldReferrers, referrerChanges)
-		if err != nil {
-			if err == errNoReferrerUpdate {
+		for attempt := 0; attempt < maxReferrersIndexAttempts; attempt++ {
+			if attempt > 0 {
+				if err := s.repo.referrersIndexRead(ctx, t); err != nil {
+					return err
+				}
+			}
+			updatedReferrers, err := t.apply(referrerChanges)
+			if err != nil {
+				if errors.Is(err, errNoReferrerUpdate) {
+					return nil
+				}
+				return err
+			}
+			confirmed, err := s.commitReferrersIndex(ctx, t, updatedReferrers)
+			if err != nil {
+				return err
+			}
+			if confirmed {
 				return nil
 			}
-			return err
+			// Another client published between our read and our publish.
+			// Re-read and merge this batch on top of their result.
 		}
-
-		// 3. push the updated referrers list using referrers tag schema
-		if len(updatedReferrers) > 0 || s.repo.skipReferrersGC() {
-			// push a new index in either case:
-			// 1. the referrers list has been updated with a non-zero size
-			// 2. OR the updated referrers list is empty but referrers GC
-			//    is skipped, in this case an empty index should still be pushed
-			//    as the old index won't get deleted
-			newIndexDesc, newIndex, err := generateIndex(updatedReferrers, subject.Digest.Algorithm())
-			if err != nil {
-				return fmt.Errorf("failed to generate referrers index for referrers tag %s: %w", referrersTag, err)
-			}
-			if err := s.push(ctx, newIndexDesc, bytes.NewReader(newIndex), referrersTag); err != nil {
-				return fmt.Errorf("failed to push referrers index tagged by %s: %w", referrersTag, err)
-			}
-		}
-
-		// 4. delete the dangling original referrers index, if applicable
-		if s.repo.skipReferrersGC() || oldIndexDesc == nil {
-			return nil
-		}
-		if err := s.repo.delete(ctx, *oldIndexDesc, true); err != nil {
-			return &ReferrersError{
-				Op:      opDeleteReferrersIndex,
-				Err:     fmt.Errorf("failed to delete dangling referrers index %s for referrers tag %s: %w", oldIndexDesc.Digest.String(), referrersTag, err),
-				Subject: subject,
-			}
-		}
-		return nil
+		return fmt.Errorf("failed to update referrers index tagged by %s after %d attempts: %w",
+			referrersTag, maxReferrersIndexAttempts, errReferrersIndexConflict)
 	}
 
 	merge, done := s.repo.referrersMergePool.Get(referrersTag)

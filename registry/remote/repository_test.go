@@ -9301,6 +9301,7 @@ func TestRepository_clone_copiesEveryField(t *testing.T) {
 	}
 	atomic.StoreInt32(&orig.referrersState, int32(properties.ReferrersAPISupported))
 	orig.singleRequestUnsupported.Store(true)
+	orig.referrersPreconditionUnsupported.Store(true)
 	orig.referrersPingLock.Lock()
 	defer orig.referrersPingLock.Unlock()
 
@@ -9317,7 +9318,8 @@ func TestRepository_clone_copiesEveryField(t *testing.T) {
 		"referrersMergePool": true,
 		// what one repository learned about the registry is not carried
 		// over, like referrersState
-		"singleRequestUnsupported": true,
+		"singleRequestUnsupported":         true,
+		"referrersPreconditionUnsupported": true,
 	}
 	for i := range repoType.NumField() {
 		field := repoType.Field(i)
@@ -9358,6 +9360,9 @@ func TestRepository_clone_copiesEveryField(t *testing.T) {
 	}
 	if clone.singleRequestUnsupported.Load() {
 		t.Error("clone().singleRequestUnsupported should be reset to false")
+	}
+	if clone.referrersPreconditionUnsupported.Load() {
+		t.Error("clone().referrersPreconditionUnsupported should be reset to false")
 	}
 	if !clone.referrersPingLock.TryLock() {
 		t.Error("clone().referrersPingLock should be unlocked")

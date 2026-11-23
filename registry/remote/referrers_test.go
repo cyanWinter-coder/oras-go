@@ -17,12 +17,16 @@ package remote
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/oras-project/oras-go/v3/internal/spec"
+	"github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
 
 func Test_buildReferrersTag(t *testing.T) {
@@ -504,6 +508,25 @@ func Test_applyReferrerChanges(t *testing.T) {
 			},
 			wantErr: nil,
 		},
+		{
+			name: "re-adding refreshes stale artifactType and annotations",
+			referrers: []ocispec.Descriptor{
+				{
+					MediaType:    descs[0].MediaType,
+					Digest:       descs[0].Digest,
+					Size:         descs[0].Size,
+					ArtifactType: "stale",
+					Annotations:  map[string]string{"k": "stale"},
+				},
+			},
+			referrerChanges: []referrerChange{
+				{descs[0], referrerOperationAdd},
+			},
+			want: []ocispec.Descriptor{
+				descs[0],
+			},
+			wantErr: nil,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -607,6 +630,92 @@ func Test_removeEmptyDescriptors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := removeEmptyDescriptors(tt.descs, tt.hint); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("removeEmptyDescriptors() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_referrersIndexTransaction_precondition(t *testing.T) {
+	tag := "sha256-" + strings.Repeat("a", 64)
+	indexDigest := digest.FromString("index")
+	tests := []struct {
+		name  string
+		state referrersIndexState
+		want  referrersIndexPrecondition
+	}{
+		{
+			name:  "no baseline uses If-None-Match",
+			state: referrersIndexState{},
+			want:  referrersIndexPrecondition{ifNoneMatch: "*"},
+		},
+		{
+			name: "entity tag validator takes precedence",
+			state: referrersIndexState{
+				desc:      ocispec.Descriptor{Digest: indexDigest},
+				exists:    true,
+				validator: `"etag-value"`,
+			},
+			want: referrersIndexPrecondition{ifMatch: `"etag-value"`},
+		},
+		{
+			name: "digest is the fallback validator",
+			state: referrersIndexState{
+				desc:   ocispec.Descriptor{Digest: indexDigest},
+				exists: true,
+			},
+			want: referrersIndexPrecondition{ifMatch: `"` + indexDigest.String() + `"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			txn := referrersIndexTransaction{tag: tag, state: tt.state}
+			if got := txn.precondition(); got != tt.want {
+				t.Errorf("precondition() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_isPreconditionFailed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "precondition failed",
+			err:  &errcode.ErrorResponse{StatusCode: http.StatusPreconditionFailed},
+			want: true,
+		},
+		{
+			name: "precondition required",
+			err:  &errcode.ErrorResponse{StatusCode: http.StatusPreconditionRequired},
+			want: false,
+		},
+		{
+			name: "wrapped precondition failed", err: fmt.Errorf("push: %w", &errcode.ErrorResponse{StatusCode: http.StatusPreconditionFailed}),
+			want: true,
+		},
+		{
+			name: "other status",
+			err:  &errcode.ErrorResponse{StatusCode: http.StatusBadRequest},
+			want: false,
+		},
+		{
+			name: "not an error response",
+			err:  errors.New("boom"),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPreconditionFailed(tt.err); got != tt.want {
+				t.Errorf("isPreconditionFailed() = %v, want %v", got, tt.want)
 			}
 		})
 	}
