@@ -30,6 +30,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	"github.com/oras-project/oras-go/v3/errdef"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 )
 
 // LookasideStore implements SignatureStore using a lookaside storage backend.
@@ -300,7 +301,8 @@ func (s *LookasideStore) fetchHTTP(ctx context.Context, rawURL string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	// error responses never read the body; drain so the connection is reusable
+	defer retry.DrainAndClose(ctx, resp)
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, &errNotFound{err: fmt.Errorf("HTTP 404: %s", rawURL)}
@@ -324,7 +326,9 @@ func (s *LookasideStore) storeHTTP(ctx context.Context, rawURL string, data []by
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	// the PUT response body is never read; drain it before closing so the
+	// connection is returned to the idle pool
+	defer retry.DrainAndClose(ctx, resp)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected HTTP status %d for PUT %s", resp.StatusCode, rawURL)
