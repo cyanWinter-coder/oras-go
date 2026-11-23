@@ -3384,17 +3384,19 @@ func TestClient_Do_Invalid_Credential_Basic(t *testing.T) {
 	}
 	client.TokenFetcher = NewCompositeTokenFetcher(client.Client, client.Header, client.ClientID, true)
 
-	// request should fail
+	// request should fail: the authenticated retry is challenged again, so
+	// the client reports an authentication loop instead of returning the
+	// second 401.
 	req, err := http.NewRequest(http.MethodGet, ts.URL, nil)
 	if err != nil {
 		t.Fatalf("failed to create test request: %v", err)
 	}
 	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("Client.Do() error = %v", err)
+	if !errors.Is(err, ErrAuthenticationLoop) {
+		t.Fatalf("Client.Do() error = %v, wantErr %v", err, ErrAuthenticationLoop)
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("Client.Do() = %v, want %v", resp.StatusCode, http.StatusUnauthorized)
+	if resp != nil {
+		t.Errorf("Client.Do() resp = %v, want nil", resp)
 	}
 	if wantRequestCount += 2; requestCount != wantRequestCount {
 		t.Errorf("unexpected number of requests: %d, want %d", requestCount, wantRequestCount)
@@ -3830,11 +3832,11 @@ func TestClient_StaticCredential_basicAuth(t *testing.T) {
 		}),
 	}
 	respInvalid, err := clientInvalid.Do(req)
-	if err != nil {
-		t.Fatalf("could not send request, err = %v", err)
+	if !errors.Is(err, ErrAuthenticationLoop) {
+		t.Fatalf("could not send request, err = %v, wantErr %v", err, ErrAuthenticationLoop)
 	}
-	if respInvalid.StatusCode != 401 {
-		t.Errorf("incorrect status code: %d, expected 401", respInvalid.StatusCode)
+	if respInvalid != nil {
+		t.Errorf("expected nil response on authentication loop, got %v", respInvalid)
 	}
 }
 
@@ -3900,11 +3902,11 @@ func TestClient_StaticCredential_withAccessToken(t *testing.T) {
 		}),
 	}
 	respInvalid, err := clientInvalid.Do(req)
-	if err != nil {
-		t.Fatalf("could not send request, err = %v", err)
+	if !errors.Is(err, ErrAuthenticationLoop) {
+		t.Fatalf("could not send request, err = %v, wantErr %v", err, ErrAuthenticationLoop)
 	}
-	if respInvalid.StatusCode != 401 {
-		t.Errorf("incorrect status code: %d, expected 401", respInvalid.StatusCode)
+	if respInvalid != nil {
+		t.Errorf("expected nil response on authentication loop, got %v", respInvalid)
 	}
 }
 
@@ -6164,7 +6166,7 @@ func TestClient_Do_Bearer_Auth_Cached_400Denied_RequestBody(t *testing.T) {
 		}
 	})
 
-	t.Run("non-rewindable PUT body returns original 400", func(t *testing.T) {
+	t.Run("non-rewindable PUT body returns a rewind error", func(t *testing.T) {
 		var requestCount atomic.Int64
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requestCount.Add(1)
@@ -6193,20 +6195,14 @@ func TestClient_Do_Bearer_Auth_Cached_400Denied_RequestBody(t *testing.T) {
 
 		client := &Client{Cache: cache}
 		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("Client.Do() error = %v", err)
+		if !errors.Is(err, ErrBodyNotRewindable) {
+			t.Fatalf("Client.Do() error = %v, wantErr %v", err, ErrBodyNotRewindable)
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("Client.Do() = %v, want %v", resp.StatusCode, http.StatusBadRequest)
+		if resp != nil {
+			t.Errorf("expected nil response, got %v", resp)
 		}
-		gotBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatalf("io.ReadAll(resp.Body) error = %v", err)
-		}
-		if string(gotBody) != deniedBody {
-			t.Errorf("resp.Body = %q, want %q", string(gotBody), deniedBody)
-		}
+		// the stale-token request is the only registry hit: the replay needed
+		// to turn the 400 DENIED into a fresh challenge cannot be attempted
 		if got := requestCount.Load(); got != 1 {
 			t.Errorf("requestCount = %d, want 1", got)
 		}

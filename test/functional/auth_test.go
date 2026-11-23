@@ -21,13 +21,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"net/http"
 	"testing"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/oras-project/oras-go/v3/registry/remote/auth"
 	"github.com/oras-project/oras-go/v3/registry/remote/credentials"
-	"github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
 
 func TestBasicAuthPushPull(t *testing.T) {
@@ -85,15 +83,13 @@ func TestWrongCredentialsFail(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected push with wrong credentials to fail, but it succeeded")
 	}
-	// Credentials are present but wrong, so the request reaches the registry
-	// and comes back as a 401. Pin the status code: without it this test also
-	// passes when the client never got far enough to authenticate at all.
-	var errResp *errcode.ErrorResponse
-	if !errors.As(err, &errResp) {
-		t.Fatalf("Push error = %v (%T), want an *errcode.ErrorResponse", err, err)
-	}
-	if errResp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("Push error status = %d, want %d", errResp.StatusCode, http.StatusUnauthorized)
+	// Credentials are present but wrong, so the request reaches the registry,
+	// is challenged once, retried with the bad credentials and challenged
+	// again. The client fails the repeated challenge explicitly rather than
+	// looping. Pin the sentinel: a connection or DNS failure would otherwise
+	// satisfy a test that only checks the error is non-nil.
+	if !errors.Is(err, auth.ErrAuthenticationLoop) {
+		t.Errorf("Push error = %v, want %v", err, auth.ErrAuthenticationLoop)
 	}
 }
 

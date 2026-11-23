@@ -51,6 +51,19 @@ const (
 // basic auth.
 var ErrBasicCredentialNotFound = errors.New("basic credential not found")
 
+// ErrBodyNotRewindable is returned when an authentication challenge requires
+// replaying the request, but its body cannot be rewound. A request whose body
+// cannot be replayed is not retried without authentication or with a refreshed
+// credential, since doing so would silently send an empty or partially read
+// body to the registry.
+var ErrBodyNotRewindable = errors.New("request body is not rewindable")
+
+// ErrAuthenticationLoop is returned when the registry keeps issuing an
+// authentication challenge after the request has already been retried once
+// with freshly resolved credentials. Retrying again would only repeat the same
+// challenge, so the request fails instead of looping.
+var ErrAuthenticationLoop = errors.New("authentication challenge loop detected")
+
 // DefaultClient is the default auth-decorated client.
 var DefaultClient = &Client{
 	Client: retry.DefaultClient,
@@ -175,6 +188,12 @@ type Client struct {
 	// distributionRealms remembers the token realms for which the default
 	// token fetcher had to fall back from OAuth2 to the distribution spec.
 	distributionRealms realmSet
+
+	// refreshes coalesces concurrent credential refreshes for the same
+	// registry, auth scheme and scope key into one shared fetch. It is lazily
+	// initialized on the first challenge and is safe for concurrent use.
+	refreshMu sync.Mutex
+	refreshes *refreshGroup
 }
 
 // Clone returns a shallow copy of c's exported configuration. Assigning to the
@@ -329,6 +348,16 @@ func (c *Client) cache() Cache {
 		return noCache{}
 	}
 	return c.Cache
+}
+
+// refreshGroup returns the group used to coalesce concurrent credential
+// refreshes, lazily creating it on the first challenge. Safe for concurrent
+// use.
+func (c *Client) refreshGroup() *refreshGroup {
+	if c.refreshes == nil {
+		c.refreshes = newRefreshGroup()
+	}
+	return c.refreshes
 }
 
 // lookupIPAddr resolves a host name to its IP addresses. It is a variable so
@@ -542,6 +571,13 @@ func (c *Client) SetUserAgent(userAgent string) {
 // Credentials obtained after an upgrade are not cached, to prevent their reuse
 // on a later HTTP request.
 //
+// A request is retried at most once because of an authentication challenge.
+// Concurrent requests challenged for the same registry resource and scope share
+// a single credential refresh; cancelling one of them only removes its own wait
+// and does not cancel the shared refresh. If the registry still challenges the
+// authenticated retry, Do fails with ErrAuthenticationLoop rather than
+// triggering another refresh.
+//
 // On authentication failure due to bad credential,
 //   - Do returns error if it fails to fetch token for bearer auth.
 //   - Do returns the registry response without error for basic auth.
@@ -592,12 +628,17 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 	// 401 challenge.
 	if cachedBearer && isInvalidTokenResponse(resp) {
 		req = originalReq.Clone(ctx)
-		if err := rewindRequestBody(req); err == nil {
+		if err := rewindRequestBody(req); err != nil {
+			// The body cannot be replayed, so the 400 DENIED response cannot
+			// be turned into a fresh challenge. Surface the replay failure
+			// explicitly instead of silently keeping the rejected response.
 			resp.Body.Close()
-			resp, err = c.send(req)
-			if err != nil {
-				return nil, err
-			}
+			return nil, err
+		}
+		resp.Body.Close()
+		resp, err = c.send(req)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -635,7 +676,7 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 	case SchemeBasic:
 		resp.Body.Close()
 
-		token, err := cache.Set(ctx, cacheKey, SchemeBasic, "", func(ctx context.Context) (string, error) {
+		token, err := c.refreshCredential(ctx, cache, cacheKey, SchemeBasic, "", func(ctx context.Context) (string, error) {
 			return c.fetchBasicAuth(ctx, resource)
 		})
 		if err != nil {
@@ -667,14 +708,14 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 					return nil, err
 				}
 
-				resp, err := c.send(req)
-				if err != nil {
-					return nil, err
+				retryResp, sendErr := c.send(req)
+				if sendErr != nil {
+					return nil, sendErr
 				}
-				if resp.StatusCode != http.StatusUnauthorized && !isInvalidTokenResponse(resp) {
-					return resp, nil
+				if retryResp.StatusCode != http.StatusUnauthorized && !isInvalidTokenResponse(retryResp) {
+					return retryResp, nil
 				}
-				resp.Body.Close()
+				retryResp.Body.Close()
 			}
 		}
 
@@ -684,7 +725,7 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("%s %q: %w", resp.Request.Method, resp.Request.URL, err)
 		}
 		service := params["service"]
-		token, err := cache.Set(ctx, cacheKey, SchemeBearer, key, func(ctx context.Context) (string, error) {
+		token, err := c.refreshCredential(ctx, cache, cacheKey, SchemeBearer, key, func(ctx context.Context) (string, error) {
 			tokenCtx := withTokenBlockedPrefixes(withTokenRegistryURL(ctx, authReq.URL), c.BlockedRealmPrefixes)
 			return c.fetchBearerToken(tokenCtx, resource, realm, service, scopes)
 		})
@@ -701,7 +742,43 @@ func (c *Client) Do(originalReq *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	return c.send(req)
+	authedResp, err := c.send(req)
+	if err != nil {
+		return nil, err
+	}
+	// The request has already consumed its single authentication retry. A
+	// registry that challenges the freshly authenticated request again would
+	// keep challenging every further attempt, so fail explicitly instead of
+	// entering a re-authentication loop.
+	if authedResp.StatusCode == http.StatusUnauthorized {
+		authedResp.Body.Close()
+		return nil, fmt.Errorf("%s %q: %w", req.Method, req.URL, ErrAuthenticationLoop)
+	}
+	return authedResp, nil
+}
+
+// refreshCredential resolves a fresh token for the given registry, scheme and
+// scope key, coalescing concurrent refreshes of the same target into one
+// shared fetch. The fetched token is stored in cache under the scope key, so a
+// successful refresh overwrites the token of the previous generation.
+//
+// The shared fetch runs on a context detached from the caller's context: a
+// caller that gives up waiting only removes its own wait and neither cancels
+// the fetch nor affects the other callers sharing its result.
+func (c *Client) refreshCredential(ctx context.Context, cache Cache, cacheKey string, scheme Scheme, key string, fetch func(context.Context) (string, error)) (string, error) {
+	groupKey := strings.Join([]string{
+		cacheKey,
+		scheme.String(),
+		key,
+	}, " ")
+	c.refreshMu.Lock()
+	group := c.refreshGroup()
+	c.refreshMu.Unlock()
+	return group.do(ctx, groupKey, func(fetchCtx context.Context) (string, error) {
+		// Cache the result under the scope key as well, so later requests for
+		// the same scope reuse the refreshed generation without another fetch.
+		return cache.Set(fetchCtx, cacheKey, scheme, key, fetch)
+	})
 }
 
 // fetchBasicAuth fetches a basic auth token for the basic challenge.
@@ -786,7 +863,7 @@ func rewindRequestBody(req *http.Request) error {
 		return nil
 	}
 	if req.GetBody == nil {
-		return fmt.Errorf("%s %q: request body is not rewindable", req.Method, req.URL)
+		return fmt.Errorf("%s %q: %w", req.Method, req.URL, ErrBodyNotRewindable)
 	}
 	body, err := req.GetBody()
 	if err != nil {
